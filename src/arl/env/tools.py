@@ -13,7 +13,6 @@ import fnmatch
 import json
 import os
 import re
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -190,24 +189,6 @@ def truncate_middle(text: str, max_chars: int) -> str:
     return text[:head] + m + (text[-tail:] if tail else "")
 
 
-def subprocess_runner(timeout_s: float = 20.0) -> TestRunner:
-    """A bare subprocess runner with a wall-clock timeout and no isolation."""
-
-    def run(root: Path, argv: list[str]) -> RunOutput:
-        try:
-            proc = subprocess.run(
-                argv, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout_s, text=True, errors="replace"
-            )
-        except subprocess.TimeoutExpired as exc:
-            out = exc.stdout or ""
-            if isinstance(out, bytes):
-                out = out.decode("utf-8", "replace")
-            return RunOutput(exit_code=None, output=out, timed_out=True)
-        return RunOutput(exit_code=proc.returncode, output=proc.stdout)
-
-    return run
-
-
 def pytest_argv(target: str) -> list[str]:
     # -B: edits that keep size and mtime-second unchanged would otherwise reuse stale .pyc files.
     return [sys.executable, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider", "--color=no", target]
@@ -220,7 +201,11 @@ class Toolbox:
         self.root = Path(os.path.realpath(root))
         if not self.root.is_dir():
             raise ValueError(f"workspace root is not a directory: {root}")
-        self.test_runner = test_runner or subprocess_runner()
+        if test_runner is None:
+            from arl.env.sandbox import sandbox_runner
+
+            test_runner = sandbox_runner()
+        self.test_runner = test_runner
 
     # -- dispatch -----------------------------------------------------------------
 
