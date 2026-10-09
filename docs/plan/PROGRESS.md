@@ -67,3 +67,42 @@
 - bwrap 的根是可写 tmpfs，往没挂载的路径（如 `/home/crq/...`）写会"成功"但只写进沙箱内存。加了 `--remount-ro /` 后这类写入直接报 `Read-only file system`。
 - `rlimit_only` 模式的已知限制（只用于 bwrap 不可用的环境）：没有文件系统隔离（能写工作区外、能读本仓库的 `data/`，也就是能读到隐藏测试）、没有网络隔离；NPROC 只能设成"当前用户已有任务数 + 64"，有竞态；进程如果 `setsid` 脱离进程组，超时时杀不到。以 root 运行时 NPROC 不生效，fork 炸弹挡不住。
 - **AutoDL 待验证**：AutoDL 实例本身是容器，可能不允许非特权 user namespace，bwrap 能不能用只能到服务器上确认。确认方法：`uv run python -c "from arl.env.sandbox import bwrap_available; print(bwrap_available())"`，再跑 `uv run pytest -q tests/test_sandbox.py` 看 bwrap 相关用例有没有被跳过。如果只能退化成 `rlimit_only`，上面的限制都会影响判分可信度，需要审计方决定怎么处理。
+
+## 第 3 步：判分 `env/grader.py`（另新增 `env/task.py`）
+
+做了什么：
+- 新增 `env/task.py`（计划的目录结构里没有，任务数据模型需要被 env、grader、taskgen 共用，所以单独放）：
+  - `Task(task_id, issue, files, hidden_setup, hidden_cases, solution, meta)`。`files` 是初始工作区（改坏的代码、`tests/test_visible.py`、原始配置）；`solution` 是覆盖到 `files` 上就得到原始正确代码的文件；`meta` 放 bug 类型、bug 所在文件和函数等分析字段，不进题面。
+  - `HiddenCase(call, check)`；`task.materialize(dest, solved=False)`；JSON 序列化、`load_tasks(path)`；构造时检查文件路径必须是仓库内相对路径，且必须有可见测试和至少一条隐藏用例。
+- `grade(task, workspace, config=None, check_visible=True) -> GradeResult`，字段：`reward`（0/1）、`hidden_pass_count`、`hidden_total`、`visible_pass`、`timed_out`、`files_changed`、`isolation`、`setup_error`、`case_passed`。不修改 agent 的工作区。
+- 判分流程按计划：把 agent 结束时的工作区拷一份（不跟随符号链接），删掉所有 `test_*.py`、`conftest.py`、`pytest.ini`、`setup.cfg`、`tox.ini`、`pyproject.toml`、`__pycache__`、`.pyc`，再写回题目原始的配置文件，放入隐藏测试，在沙箱里跑。隐藏用例全过且没超时，奖励才是 1。
+- `visible_pass`：另拷一份干净副本，放回**原始**可见测试，用 pytest 跑 agent 的代码。只做分析，不进奖励。
+- `files_changed`：和题目初始文件比，列出新增、修改、删除的路径（忽略 `__pycache__` 和 `.pyc`）。
+
+**设计决定（请审计方确认）：隐藏测试的期望值不进沙箱。** 如果隐藏测试也是 pytest 文件、在沙箱里和 agent 的代码同进程运行，agent 的代码在被 import 时可以 monkeypatch pytest、注册 atexit 伪造报告、或者通过调用栈读到断言里的期望值，进程内无法可靠防住。所以把每条隐藏断言拆成两半：
+- `call`：在沙箱里执行的表达式（如 `pkg.nums.add(2, 5)`），由一个小 harness（`python -I -B`，先把 stdout/stderr 重定向到 `/dev/null`，只通过复制出来的 fd 输出）求值，把返回值序列化成带类型标签的纯数据（区分 list/tuple/set/frozenset/dict/bytes/complex；int/float/str/list 等的子类按基类方法取值，自定义 `__eq__` 不会被带出来；其他类型记为 opaque）。抛异常时只记录异常类型名。
+- `check`：在宿主机上求值的表达式（如 `result == 7`、`abs(result - 0.5) < 1e-6`、`error == 'ValueError'`），`result` 绑定反序列化后的值。opaque 值和异常标记做任何比较、真值判断、取长度、迭代都会抛错，判为不通过。
+- 同一条用例出现多条记录（伪造），该用例判失败；harness 没输出的用例（提前退出、超时）判失败。
+
+这样 agent 的代码在沙箱里能做的最多是"输出一些值"，而不知道期望值就伪造不出正确的值，所以 `sys.exit`、`os._exit`、篡改 pytest、伪造输出、恒等对象都拿不到奖励。判分仍然是"拷干净副本、删测试和配置、放回原始配置和隐藏测试、在沙箱里跑"，只是隐藏测试的格式从 pytest 文件变成了 `call`/`check` 对。代价是第 5 步造题时要把 MBPP/HumanEval 的断言拆成 `call` 和 `check`，拆不出来的断言不能用（计划本来就允许丢掉拆不够 3 条断言的函数）。
+
+防作弊测试（`tests/test_grader.py`，全部通过）：
+- 改可见测试（把断言换成 `pass`）：`run_tests` 显示通过，但奖励仍是 0；在此基础上再修对代码，奖励是 1。
+- 在根目录或 `tests/` 写劫持用的 `conftest.py`（hookwrapper 把所有报告改成 passed）：`run_tests` 显示通过，判分时被删掉，奖励 0。
+- 往 `pytest.ini`、`setup.cfg`、`tox.ini`、`pyproject.toml` 里写 `-p no:python` 一类配置：被删掉并换回原始配置，奖励 0。
+- import 时 `sys.exit(0)`、`os._exit(0)`、`raise SystemExit(0)`，以及函数里 `os._exit(0)`：隐藏用例 0 条通过。
+- monkeypatch pytest（`_pytest.python.Function.runtest = lambda self: None`）：`run_tests` 显示通过，奖励 0。
+- 硬编码返回值（`return 3`）：可见测试通过（`visible_pass=True`），隐藏用例 0 条通过。
+- 往 fd 1–19 和 stdout 写伪造的 harness 记录：所有用例因重复记录判失败。
+- 返回 `__eq__` 恒为 True 的对象（int 子类和普通类各一种）：`run_tests` 显示通过，奖励 0。
+- 在工作区放假的 `_arl_hidden.py` / `_arl_hidden.json` 和 `sitecustomize.py`：被覆盖或不生效，奖励 0。
+- 把 bug 文件换成指向工作区外正确答案的符号链接：bwrap 模式下奖励 0。
+- 什么都不改：奖励 0。
+- 另有：正确修复和参考答案奖励 1、判分不改动工作区、隐藏用例不出现在工作区里、语法错误记 `setup_error`、隐藏用例超时、序列化类型区分（list 和 tuple 不相等、set、dict、nan、异常类型）、opaque 值任何检查都失败、`Task` JSON 往返和非法路径。
+
+测试结果：`uv run pytest -q` → 103 passed（约 22 秒）。
+
+遇到的问题：
+- 一开始把 `pkg/conftest.py` 也列为劫持场景，但 pytest 跑 `tests/` 时根本不会加载它，所以测试前提不成立，删掉了这个参数。
+- 有一次测试结果是旧代码的：测试进程在编辑器写完文件之前就启动了，重跑即正常，不是代码问题。
+- 隐藏用例在同一个进程里顺序执行，没有单条超时；一条死循环会让整次运行超时，`hidden_pass_count` 只统计超时前完成的用例。奖励不受影响（反正是 0）。
