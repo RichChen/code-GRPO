@@ -31,7 +31,9 @@ IGNORED_DIR_NAMES = frozenset({"__pycache__", ".pytest_cache"})
 HARNESS_FILE = "_arl_hidden.py"
 SPEC_FILE = "_arl_hidden.json"
 
-_HARNESS = r'''
+# Shared by the grading harness and the task-validation harness: silences the untrusted code's
+# stdout/stderr, and defines enc() (value -> tagged plain data), ename() and emit().
+HARNESS_PRELUDE = r'''
 import json, os, sys
 
 _dumps = json.dumps
@@ -86,7 +88,9 @@ def ename(e):
         return type.__dict__["__name__"].__get__(type(e))
     except BaseException:
         return "BaseException"
+'''
 
+_HARNESS = HARNESS_PRELUDE + r'''
 
 def main():
     with open(sys.argv[1], encoding="utf-8") as f:
@@ -109,6 +113,12 @@ def main():
 
 main()
 '''
+
+
+def harness_argv(*args: str) -> list[str]:
+    # -S skips site (no sitecustomize / .pth from anywhere). Not -I: that implies -E, which would
+    # drop the sandbox's PYTHONHASHSEED=0 and make set/dict-of-str iteration order vary between runs.
+    return [sys.executable, "-S", "-B", *args]
 
 
 class _Undecidable:
@@ -250,7 +260,7 @@ def run_hidden(task: Task, copy: Path, config: SandboxConfig) -> tuple[list[bool
     _write(copy, HARNESS_FILE, _HARNESS)
     spec = {"setup": task.hidden_setup, "calls": [c.call for c in task.hidden_cases]}
     _write(copy, SPEC_FILE, json.dumps(spec))
-    result = run_in_sandbox(copy, [sys.executable, "-I", "-B", HARNESS_FILE, SPEC_FILE], config)
+    result = run_in_sandbox(copy, harness_argv(HARNESS_FILE, SPEC_FILE), config)
 
     n = len(task.hidden_cases)
     records: dict[int, dict[str, Any]] = {}

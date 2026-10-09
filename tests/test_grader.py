@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from arl.env.grader import Opaque, Raised, changed_files, decode, evaluate_check, grade
+from arl.env.grader import Opaque, Raised, changed_files, decode, evaluate_check, grade, harness_argv
+from arl.env.sandbox import run_in_sandbox
 from arl.env.task import HiddenCase, Task, load_tasks
 from arl.env.tools import Toolbox
 
@@ -247,6 +248,12 @@ def test_list_vs_tuple_is_distinguished(task, workspace):
     ]})
     g = grade(t, workspace, check_visible=False)
     assert g.case_passed == [True, True, True, True, True, True, False]
+
+
+def test_hidden_harness_uses_fixed_hash_seed(workspace):
+    (workspace / "p.py").write_text("import os\nprint(os.environ.get('PYTHONHASHSEED'), list({'apple', 'banana', 'cherry', 'date'}))\n")
+    outputs = {run_in_sandbox(workspace, harness_argv("p.py")).output for _ in range(4)}
+    assert len(outputs) == 1 and outputs.pop().startswith("0 ")
 
 
 # -- task model ----------------------------------------------------------------------------

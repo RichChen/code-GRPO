@@ -86,6 +86,10 @@ agentic-rl/
   - 直接改测试要 import 的目标函数，硬编码返回值，只能骗过可见测试，骗不过隐藏测试（这条要求隐藏测试的输入和可见测试不同）；
   - 什么都不改，奖励是 0。
 
+**审计修订 1**
+
+隐藏测试不再是 pytest 文件，而是 `HiddenCase(call, check)`：`call` 在沙箱里求值，`check` 在宿主机上对解码后的值求值。可见测试仍是 pytest 文件。
+
 ### 第 4 步：Episode 循环 `env/episode.py`
 
 - 接口：`run_episode(task, policy, max_turns=8) -> EpisodeResult`。其中 `policy` 是一个可调用对象，输入 messages 和 tools，返回一条 assistant 消息（可以带 tool_calls）。这样阶段 3 可以把训练框架的采样器直接接进来。
