@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from arl.env.task import VISIBLE_TEST_PATH, HiddenCase, Task
+from arl.taskgen.augment import augment_function
+from arl.taskgen.dedup import MAX_MOVED_FRACTION, clusters, near_duplicates
 from arl.taskgen.mutate import BUG_TYPES, enumerate_mutants, rename_names
 from arl.taskgen.sources import RAW_FILES, Case, SourceFunction, load_sources, sha256_file
 from arl.taskgen.validate import FunctionScreen, MutantVerdict, count_reasons, screen_function, validate_task
@@ -28,6 +30,8 @@ HELDOUT_FRACTION = 0.3
 MODULES_RANGE = (3, 5)
 FUNCTIONS_RANGE = (2, 4)
 MAX_PER_FUNCTION_BUG = 2
+MAX_CLUSTER_SIZE = 30
+MIN_BUG_HIDDEN = 5
 PYTEST_INI = "[pytest]\ntestpaths = tests\n"
 ACTUAL_MAX_CHARS = 120
 ISSUE_PART_MAX_CHARS = 300
@@ -42,16 +46,43 @@ ISSUE_TEMPLATES = {
 }
 
 
+class BuildStopped(RuntimeError):
+    """A condition the plan says must be reported instead of worked around."""
+
+
 # -- split ----------------------------------------------------------------------------------------
 
 
+def split_clusters(cluster_list: list[list[str]], seed: int, heldout_fraction: float = HELDOUT_FRACTION) -> dict[str, str]:
+    """Map source_id -> "train" | "heldout", whole clusters at a time.
+
+    Clusters are shuffled with ``split-{seed}`` and added to heldout until it holds at least
+    ``heldout_fraction`` of all functions (it may overshoot by less than one cluster).
+    """
+    order = sorted(cluster_list, key=lambda c: c[0])
+    random.Random(f"split-{seed}").shuffle(order)
+    target = heldout_fraction * sum(len(c) for c in order)
+    out: dict[str, str] = {}
+    held = 0
+    for c in order:
+        split = "heldout" if held < target else "train"
+        if split == "heldout":
+            held += len(c)
+        for sid in c:
+            out[sid] = split
+    return out
+
+
 def split_functions(funcs: list[SourceFunction], seed: int, heldout_fraction: float = HELDOUT_FRACTION) -> dict[str, str]:
-    """Map source_id -> "train" | "heldout". Fixed by seed, decided before any mutation."""
-    ids = sorted(f.source_id for f in funcs)
-    rng = random.Random(f"split-{seed}")
-    rng.shuffle(ids)
-    n_held = round(len(ids) * heldout_fraction)
-    return {sid: ("heldout" if i < n_held else "train") for i, sid in enumerate(ids)}
+    """Cluster near-duplicate functions, then split by cluster. Fixed by seed, decided before any mutation."""
+    return split_clusters(clusters(funcs), seed, heldout_fraction)
+
+
+def check_split(funcs: list[SourceFunction], split_of: dict[str, str]) -> list[dict]:
+    """Near duplicates left in heldout after the cluster split; by construction there should be none."""
+    held = [f for f in funcs if split_of[f.source_id] == "heldout"]
+    train = [f for f in funcs if split_of[f.source_id] == "train"]
+    return near_duplicates(held, train)
 
 
 def check_no_leakage(tasks_by_split: dict[str, list[Task]]) -> None:
@@ -236,8 +267,7 @@ def assemble_task(
 
     mutant_code = rename_names(verdict.mutant.code, bug.mapping)
     outcomes = verdict.outcomes
-    failing = [i for i, o in enumerate(outcomes) if not o.passed]
-    bug.visible_index = failing[0]
+    bug.visible_index = next(i for i, o in enumerate(outcomes) if not o.passed and bug_src.cases[i].kind == "test")
 
     files: dict[str, str] = {"pkg/__init__.py": "", "pytest.ini": PYTEST_INI}
     solution: dict[str, str] = {}
@@ -258,6 +288,7 @@ def assemble_task(
     files[VISIBLE_TEST_PATH] = "\n".join(lines) + "\n"
 
     hidden: list[HiddenCase] = []
+    hidden_kinds: list[str] = []
     functions_meta = []
     for p in ordered:
         indices = []
@@ -266,6 +297,7 @@ def assemble_task(
                 continue
             indices.append(len(hidden))
             hidden.append(HiddenCase(call=f"pkg.{p.module}.{case.call(p.name)}", check=case.check()))
+            hidden_kinds.append(case.kind)
         functions_meta.append(
             {
                 "name": p.name,
@@ -287,6 +319,9 @@ def assemble_task(
         min(len(shipped_lines), len(original_lines)) + 1,
     )
     spec = verdict.mutant.spec
+    bug_hidden = [i for i in range(len(bug_src.cases)) if i != bug.visible_index]
+    bug_hidden_counts = dict(Counter(bug_src.cases[i].kind for i in bug_hidden))
+    bug_hidden_failing = dict(Counter(bug_src.cases[i].kind for i in bug_hidden if not outcomes[i].passed))
     task = Task(
         task_id=task_id,
         issue=issue,
@@ -305,6 +340,9 @@ def assemble_task(
             "bug_source": bug_src.source_id,
             "source_ids": sorted(p.fn.source_id for p in builder.placed),
             "functions": functions_meta,
+            "hidden_case_kinds": hidden_kinds,
+            "bug_hidden_counts": bug_hidden_counts,
+            "bug_hidden_failing": bug_hidden_failing,
             "issue_template": template,
             "n_modules": len(by_module),
             "n_functions": len(builder.placed),
@@ -346,17 +384,37 @@ def build(raw_dir: Path, out_dir: Path, seed: int = 0, workers: int = 8, cap: in
 def build_from_functions(funcs: list[SourceFunction], out_dir: Path, seed: int = 0, workers: int = 8,
                          cap: int = MAX_PER_FUNCTION_BUG, log=print,
                          modules_range: tuple[int, int] = MODULES_RANGE,
-                         functions_range: tuple[int, int] = FUNCTIONS_RANGE) -> dict:
+                         functions_range: tuple[int, int] = FUNCTIONS_RANGE, augment: bool = True) -> dict:
     t0 = time.monotonic()
-    split_of = split_functions(funcs, seed)
-    log(f"[build] {len(funcs)} source functions, {sum(1 for s in split_of.values() if s == 'heldout')} held out")
+    cluster_list = clusters(funcs)
+    largest = max(len(c) for c in cluster_list)
+    if largest > MAX_CLUSTER_SIZE:
+        raise BuildStopped(f"largest near-duplicate cluster has {largest} functions (> {MAX_CLUSTER_SIZE})")
+    split_of = split_clusters(cluster_list, seed)
+    n_held = sum(1 for s in split_of.values() if s == "heldout")
+    leftover = check_split(funcs, split_of)
+    if leftover:
+        raise BuildStopped(f"{len(leftover)} near duplicates remain after the cluster split: {leftover[:5]}")
+    if n_held and len(leftover) > MAX_MOVED_FRACTION * n_held:
+        raise BuildStopped("near duplicates above the 10% backstop")
+    log(f"[build] {len(funcs)} source functions in {len(cluster_list)} clusters (largest {largest}), {n_held} held out")
+
+    aug_stats: Counter = Counter()
+    if augment:
+        with ThreadPoolExecutor(workers) as ex:
+            results = list(ex.map(augment_function, funcs))
+        funcs = [r.fn for r in results]
+        for r in results:
+            aug_stats.update(r.stats)
+        log(f"[build] augmented hidden cases in {time.monotonic() - t0:.0f}s: {aug_stats['generated']} generated")
+    t_augment = time.monotonic() - t0
 
     def screen(fn: SourceFunction) -> FunctionScreen:
         return screen_function(fn, enumerate_mutants(fn.code, fn.entry, _arg_values(fn)))
 
     with ThreadPoolExecutor(workers) as ex:
         screens = list(ex.map(screen, funcs))
-    t_screen = time.monotonic() - t0
+    t_screen = time.monotonic() - t0 - t_augment
     log(f"[build] screened in {t_screen:.0f}s")
 
     function_discards = Counter(s.original_reason for s in screens if not s.original_ok)
@@ -371,13 +429,17 @@ def build_from_functions(funcs: list[SourceFunction], out_dir: Path, seed: int =
     # Slots: per (function, bug type) up to `cap` tasks at distinct positions. Candidates beyond
     # the first `cap` are replacements used only if a selected one fails full validation.
     queue: list[tuple[str, SourceFunction, str, list[MutantVerdict]]] = []
+    task_reasons: Counter = Counter()
     for s in usable:
         for bug_type, cands in candidate_slots(s, seed, cap).items():
+            if len(s.fn.cases) - 1 < MIN_BUG_HIDDEN:
+                task_reasons[f"{bug_type}:too_few_hidden_cases"] += min(cap, len(cands))
+                continue
             queue.append((split_of[s.fn.source_id], s.fn, bug_type, cands))
 
-    task_reasons: Counter = Counter()
     accepted: dict[str, list[Task]] = {"train": [], "heldout": []}
     grade_times: list[float] = []
+    by_id = {f.source_id: f for f in funcs}
 
     def attempt(item: tuple[str, SourceFunction, str, list[MutantVerdict]]) -> tuple[list[Task], Counter, list[float]]:
         split, fn, bug_type, cands = item
@@ -431,7 +493,7 @@ def build_from_functions(funcs: list[SourceFunction], out_dir: Path, seed: int =
     pass_rates = {}
     for b in BUG_TYPES:
         screened_ok = mutant_reasons.get(f"{b}:ok", 0)
-        attempted = sum(v for k, v in task_reasons.items() if k.startswith(f"{b}:"))
+        attempted = sum(v for k, v in task_reasons.items() if k.startswith(f"{b}:") and not k.endswith(":too_few_hidden_cases"))
         validated_ok = task_reasons.get(f"{b}:ok", 0)
         pass_rates[b] = {
             "mutants_generated": generated.get(b, 0),
@@ -442,6 +504,17 @@ def build_from_functions(funcs: list[SourceFunction], out_dir: Path, seed: int =
             "validation_pass_rate": round(validated_ok / attempted, 3) if attempted else None,
             "final_tasks": final.get(b, 0),
         }
+
+    def dist(values: list[int]) -> dict[str, int]:
+        return {str(k): v for k, v in sorted(Counter(values).items())}
+
+    def hidden_of(t: Task, kinds: tuple[str, ...]) -> int:
+        return sum(v for k, v in t.meta["bug_hidden_counts"].items() if k in kinds)
+
+    gen_total = sum(t.meta["bug_hidden_counts"].get("generated", 0) for t in all_tasks)
+    gen_failing = sum(t.meta["bug_hidden_failing"].get("generated", 0) for t in all_tasks)
+    sizes = [len(c) for c in cluster_list]
+    origin_of = {f.source_id: f.origin for f in funcs}
     manifest = {
         "seed": seed,
         "config": {
@@ -450,6 +523,9 @@ def build_from_functions(funcs: list[SourceFunction], out_dir: Path, seed: int =
             "case_timeout_s": 1.0,
             "modules_per_task": list(modules_range),
             "functions_per_module": list(functions_range),
+            "min_bug_hidden_cases": MIN_BUG_HIDDEN,
+            "max_cluster_size": MAX_CLUSTER_SIZE,
+            "augment": augment,
         },
         "raw_files": {name: {"url": spec["url"], "sha256": spec["sha256"]} for name, spec in RAW_FILES.items()},
         "counts": {split: len(tasks) for split, tasks in accepted.items()} | {"total": len(all_tasks)},
@@ -457,12 +533,37 @@ def build_from_functions(funcs: list[SourceFunction], out_dir: Path, seed: int =
         "pass_rate_by_bug_type": pass_rates,
         "source_functions": {
             "loaded": len(funcs),
+            "loaded_by_origin": dict(sorted(Counter(f.origin for f in funcs).items())),
             "usable_after_screening": len(usable),
+            "usable_by_origin": dict(sorted(Counter(s.fn.origin for s in usable).items())),
             "by_split": {split: len(pool) for split, pool in pools.items()},
-            "by_dataset_usable": dict(Counter(f.source_id.split("/")[0] for s in usable for f in [s.fn])),
+            "by_split_and_origin": {split: dict(sorted(Counter(f.origin for f in pool).items())) for split, pool in pools.items()},
         },
-        "bug_sources_by_dataset": {
-            split: dict(Counter(t.meta["bug_source"].split("/")[0] for t in tasks)) for split, tasks in accepted.items()
+        "clustering": {
+            "jaccard_threshold": 0.8,
+            "clusters": len(cluster_list),
+            "cluster_size_distribution": dist(sizes),
+            "largest_5": [
+                {"size": len(c), "split": split_of[c[0]], "members": [f"{sid} {by_id[sid].entry}" for sid in c]}
+                for c in sorted(cluster_list, key=lambda c: (-len(c), c[0]))[:5]
+            ],
+            "heldout_functions": n_held,
+            "near_duplicates_after_split": len(leftover),
+        },
+        "augmentation": {
+            "stats": dict(sorted(aug_stats.items())),
+            "bug_hidden_cases_distribution": {
+                "test_only": dist([hidden_of(t, ("test",)) for t in all_tasks]),
+                "test_and_challenge": dist([hidden_of(t, ("test", "challenge")) for t in all_tasks]),
+                "after_augmentation": dist([hidden_of(t, ("test", "challenge", "generated")) for t in all_tasks]),
+            },
+            "bug_generated_cases": gen_total,
+            "bug_generated_cases_failing_on_buggy": gen_failing,
+            "bug_generated_failing_fraction": round(gen_failing / gen_total, 3) if gen_total else None,
+            "tasks_where_some_generated_case_fails": sum(1 for t in all_tasks if t.meta["bug_hidden_failing"].get("generated")),
+        },
+        "bug_sources_by_origin": {
+            split: dict(sorted(Counter(origin_of[t.meta["bug_source"]] for t in tasks).items())) for split, tasks in accepted.items()
         },
         "distinct_bug_functions": {split: len({t.meta["bug_source"] for t in tasks}) for split, tasks in accepted.items()},
         "issue_templates": dict(Counter(t.meta["issue_template"] for t in all_tasks)),
@@ -473,6 +574,7 @@ def build_from_functions(funcs: list[SourceFunction], out_dir: Path, seed: int =
             "task_validation": dict(sorted(task_reasons.items())),
         },
         "timing_s": {
+            "augmentation": round(t_augment, 1),
             "screening": round(t_screen, 1),
             "assembly_and_validation": round(t_validate, 1),
             "grade_median": round(sorted(grade_times)[len(grade_times) // 2], 3) if grade_times else None,
@@ -496,7 +598,11 @@ def main(argv: list[str] | None = None) -> int:
         from arl.taskgen.sources import download_raw
 
         download_raw(args.raw)
-    manifest = build(args.raw, args.out, seed=args.seed, workers=args.workers, limit_functions=args.limit_functions)
+    try:
+        manifest = build(args.raw, args.out, seed=args.seed, workers=args.workers, limit_functions=args.limit_functions)
+    except BuildStopped as e:
+        print(f"[build] STOPPED: {e}", file=sys.stderr)
+        return 2
     print(json.dumps(manifest["counts"]))
     return 0
 

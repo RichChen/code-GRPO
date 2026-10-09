@@ -1,5 +1,6 @@
 import json
 import math
+from collections import Counter
 
 from arl.taskgen.augment import (
     MAX_EXTRA_LEN,
@@ -7,6 +8,7 @@ from arl.taskgen.augment import (
     augment_function,
     candidate_inputs,
     canonical,
+    infer_invariants,
     lit,
     literal_source,
     parse_args,
@@ -89,11 +91,11 @@ def test_augment_uses_isclose_for_float_results():
 
 
 def test_augment_discards_raising_and_nondeterministic_inputs():
-    picky = fn("def picky(x):\n    if x < 0:\n        raise ValueError\n    return x\n", "picky", [("1", "1"), ("2", "2"), ("3", "3")])
+    picky = fn("def picky(x):\n    if x > 3:\n        raise ValueError\n    return x\n", "picky", [("1", "1"), ("2", "2"), ("3", "3")])
     res = augment_function(picky)
     for c in res.fn.cases:
         if c.kind == "generated":
-            assert parse_args(c.args)[0][0] >= 0
+            assert 0 < parse_args(c.args)[0][0] <= 3
     assert res.stats["discard:raises"] > 0
     noisy = fn("import random\n\ndef noisy(x):\n    return x + random.random()\n", "noisy", [("1", "1"), ("2", "2"), ("3", "3")])
     res = augment_function(noisy)
@@ -105,6 +107,42 @@ def test_augment_drops_challenge_cases_the_original_fails():
     res = augment_function(f)
     assert [c.args for c in res.fn.cases if c.kind == "challenge"] == ["2, 3"]
     assert res.stats["challenge_original_fails"] == 1
+
+
+# -- input invariants -------------------------------------------------------------------------------
+
+
+def _inv(cases: list[str]):
+    return infer_invariants([parse_args(a) for a in cases])
+
+
+def test_invariants_inferred_from_test_cases():
+    inv = _inv(["[1, 2, 5], 3, 2", "[0, 4], 2, 1", "[3, 7, 8, 9], 4, 5"])
+    assert inv.len_of == {("p", 1): ("p", 0)}
+    assert inv.int_positive == [("p", 2)] and inv.nonempty == [("p", 0)] and inv.ascending == [("p", 0)]
+    inv = _inv(["[3, 1], [2, 2], 0", "[5, 4, 1], [1, 1, 1], 7", "[2, 1], [0, 0], 0"])
+    assert inv.descending == [("p", 0)] and inv.int_nonnegative == [("p", 2)]
+    assert (("p", 0), ("p", 1)) in inv.equal_length
+    assert _inv(["[1], 'a'", "[], 'b'", "[2, 2], ''"]).present() == []
+
+
+def test_invariant_violations_are_reported_by_name():
+    inv = _inv(["[1, 2, 5], 3, 2", "[0, 4], 2, 1", "[3, 7, 8, 9], 4, 5"])
+    assert inv.violations(([[1, 2], 2, 1], [])) == []
+    assert set(inv.violations(([[], 3, 0], []))) == {"len_of", "int_positive", "nonempty"}
+    assert inv.violations(([[2, 1], 2, 1], [])) == ["ascending"]
+
+
+def test_generated_inputs_keep_the_invariants():
+    f = fn("def kth(xs, n, k):\n    return xs[k - 1] + n\n", "kth",
+           [("[1, 2, 5], 3, 2", "5"), ("[0, 4], 2, 1", "2"), ("[3, 7, 8, 9], 4, 3", "12")])
+    stats = Counter()
+    cands = candidate_inputs(f, stats=stats)
+    assert cands
+    for args in cands:
+        xs, n, k = parse_args(args)[0]
+        assert n == len(xs) and xs and xs == sorted(xs) and k > 0
+    assert stats["functions_with:len_of"] == 1 and stats["discard:invariant"] > 0
 
 
 # -- near duplicates --------------------------------------------------------------------------------

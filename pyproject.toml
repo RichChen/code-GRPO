@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Agentic RL: train small models to fix code with multi-turn tool calls (GRPO on a single GPU)."
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
-dependencies = []
+dependencies = [
+    "openai>=3.27.0",
+]
 
 [dependency-groups]
 dev = ["pytest>=8"]

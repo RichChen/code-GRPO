@@ -60,6 +60,34 @@ def jaccard(a: frozenset, b: frozenset) -> float:
     return len(a & b) / len(a | b)
 
 
+def clusters(funcs: list[SourceFunction], threshold: float = JACCARD_THRESHOLD) -> list[list[str]]:
+    """Connected components of the graph with an edge between functions whose Jaccard exceeds ``threshold``.
+
+    Each cluster is a sorted list of source ids; clusters are sorted by their first member.
+    """
+    ids = sorted(f.source_id for f in funcs)
+    grams = {f.source_id: trigrams(f) for f in funcs}
+    parent = {i: i for i in ids}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i, a in enumerate(ids):
+        ga = grams[a]
+        for b in ids[i + 1 :]:
+            if jaccard(ga, grams[b]) > threshold:
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[max(ra, rb)] = min(ra, rb)
+    groups: dict[str, list[str]] = {}
+    for i in ids:
+        groups.setdefault(find(i), []).append(i)
+    return sorted((sorted(g) for g in groups.values()), key=lambda g: g[0])
+
+
 def near_duplicates(heldout: list[SourceFunction], train: list[SourceFunction],
                     threshold: float = JACCARD_THRESHOLD) -> list[dict]:
     """Held-out functions whose max Jaccard similarity to any training function exceeds ``threshold``."""

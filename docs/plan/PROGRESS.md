@@ -218,3 +218,44 @@
 遇到的问题：
 - 宿主进程的字符串哈希是随机的，`repr(set)` 的元素顺序会变，会让构建不确定。生成用例时改用自己的渲染函数，集合元素排序后输出。
 - Python 3.9 以后 `ast.literal_eval("set()")` 是合法的，空集合可以作为期望值；宿主机求值 `check` 时内置函数可用。
+
+## 第 5b 步（完成）
+
+做了什么：
+- 把"审计修订 3"原样补进计划第 5 步末尾，单独提交（`1ca78cc`）。
+- `dedup.py` 新增 `clusters()`：在全部 1070 个来源函数上两两算 Jaccard，大于 0.8 连边，用并查集求连通分量。
+- `build.py` 改为按簇划分：`split_clusters()` 用 `split-{seed}` 打乱簇的顺序，依次放进留出集，直到达到 30%；`check_split()` 划分后再跑一遍 `near_duplicates`，不是 0 或者超过 10% 都会抛 `BuildStopped`；最大簇超过 30 个函数也会抛 `BuildStopped`。
+- `augment.py` 新增输入不变量，按修订 3 第 3 条，从 `kind="test"` 用例推断：
+  - 整数 ≥0 / >0；
+  - 等于某个序列的 `len()`（扰动序列后重新计算，不单独扰动）；
+  - 序列非空；
+  - 升序 / 降序（要求至少一个种子严格单调）；
+  - 两序列等长（要求至少一个种子长度 ≥2）。
+  不满足的候选丢弃，按不变量分别计数。
+- augment 接进 `build.py`：先丢掉原始代码跑不过的 challenge 用例，每个函数最多补 10 条；bug 函数隐藏用例少于 5 条的题丢弃（`too_few_hidden_cases`）；可见测试只从 `kind="test"` 用例里取。manifest 新增 `clustering`、`augmentation` 两节。
+- 新增 `src/arl/rollout/`（`client.py`：OpenAI 兼容客户端；`calibrate.py`：校准、筛选，为第 6 步准备）和 `configs/rollout.json`。`episode.py` 新增 `PolicyContextExceeded`（上下文超长时 episode 结束，记为 `context_limit`，照常判分）和 `replay_workspace()`（重放 edit_file，复原 agent 最终代码）。依赖新增 `openai`，锁文件里的源全部是 pypi.org。
+
+结果：
+- 共 4732 道题（train 3232、heldout 1500），整题验证通过率 100%。连续构建两次，sha256 相同：
+  - train `f0038c46eb4b089daabe68ba7246cf086fe521458a24bc2a82e47b5e7840aa82`
+  - heldout `d28e0709bb81af8196837efaec77ed3833d952ea25fcc1d457aa87f15d7cc3d4`
+  - 两份 manifest 除计时字段外完全一致。
+- 簇：945 个，大小分布 1:854、2:75、3:7、4:5、5:2、6:1、9:1。最大的簇 9 个函数（逐元素元组运算一族），不超过 30。划分后留出集近似重复为 0。留出集 321 个函数，筛查后可用 320 个；不同 bug 来源函数 train 648、heldout 273。
+- 不变量：
+  - 命中函数数：int_positive 401、nonempty 673、ascending 105、descending 4、equal_length 47、int_nonnegative 30、len_of 64。
+  - 丢弃的候选数（按尝试次数计）：int_positive 14861、ascending 4339、equal_length 4214、nonempty 3038、int_nonnegative 551、descending 93。
+- 加强：共生成 10395 条用例。丢弃原因：原始代码抛异常 729、超时 13、期望值过长 27、不能还原为字面量 6、容器里含浮点 4。
+- bug 函数的隐藏用例数：
+  - 加强前只算 test 用例，3884/4732 道题只有 2 条；
+  - 加强后最少 5 条，众数 12 条（3467 道）。
+  - 补出来的用例共 45721 条（按题计），其中 33002 条（72.2%）能让 bug 版失败；4654/4732 道题里至少有一条补出的用例失败。
+  - 没有题因为 `too_few_hidden_cases` 被丢弃。
+- 50 题脚本化检查（`runs/checkpoint-1c-5b/`）：原样提交 0/50、只改可见测试 0/50、应用参考答案 50/50 拿到奖励。
+- 构建耗时约 20.5 分钟（加强 74 秒、筛查 146 秒、组装加验证 1005 秒）。
+
+测试结果：`uv run pytest -q` → 198 passed（约 84 秒）。
+
+遇到的问题：
+- `openai` 3.27 依赖的是 `httpx2`，不是 `httpx`，测试里改成 `import httpx2`。
+- 校准时如果构造 policy 就抛异常，原先不会写记录，改成也记为错误，续跑时重跑。
+- 抽查生成的用例时发现，不变量规则覆盖不到"语义约束"。例如 `find_Extra(arr1, arr2, n)` 要求 arr2 只比 arr1 少一个元素，生成的输入少了两个，期望值仍然是原始代码算出的确定结果，但在原题语境下不合理。详见 CHECKPOINT-1C 的抽样表，不再额外处理。

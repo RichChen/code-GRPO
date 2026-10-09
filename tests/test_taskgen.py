@@ -14,8 +14,11 @@ from arl.taskgen.build import (
     build_from_functions,
     candidate_slots,
     check_no_leakage,
+    check_split,
+    split_clusters,
     split_functions,
 )
+from arl.taskgen.dedup import clusters
 from arl.taskgen.mutate import BUG_TYPES, MutationSpec, apply_mutation, enumerate_mutants, infer_local_types, rename_names
 from arl.taskgen.sources import Case, Discard, SourceFunction, load_sources, normalise_module, parse_assert
 from arl.taskgen.validate import check_task_static, screen_function, validate_task
@@ -350,3 +353,60 @@ def test_generated_task_set_has_no_split_leakage():
 
     for name, digest in manifest["files"].items():
         assert sha256_file(TASKS / name) == digest
+
+
+# -- cluster split (audit revision 3) ---------------------------------------------------------------
+
+
+def test_split_clusters_keeps_clusters_together_and_reaches_fraction():
+    cl = [[f"c{i}/{j}" for j in range(size)] for i, size in enumerate([5, 1, 1, 3, 2, 1, 1, 4, 1, 1])]
+    split = split_clusters(cl, seed=0)
+    for c in cl:
+        assert len({split[s] for s in c}) == 1
+    held = [s for s, v in split.items() if v == "heldout"]
+    assert 0.3 * 20 <= len(held) < 0.3 * 20 + 5
+    assert split == split_clusters(list(reversed(cl)), seed=0)
+
+
+def test_near_duplicate_functions_never_straddle_the_split():
+    dup = src("syn/99", "add_all_2", "def add_all_2(ys):\n    s = 0\n    for y in ys:\n        s = s + y\n    return s\n",
+              [("[1]", "1"), ("[2, 2]", "4"), ("[]", "0")])
+    funcs = SYNTHETIC + [dup]
+    groups = clusters(funcs)
+    assert ["syn/0", "syn/99"] in groups
+    for seed in range(20):
+        split = split_functions(funcs, seed)
+        assert split["syn/0"] == split["syn/99"]
+        assert check_split(funcs, split) == []
+
+
+@has_raw
+def test_real_cluster_split_has_no_cross_split_near_duplicates():
+    funcs, _ = load_sources(RAW)
+    split = split_functions(funcs, 0)
+    for c in clusters(funcs):
+        assert len({split[s] for s in c}) == 1
+    assert check_split(funcs, split) == []
+
+
+# -- strengthened hidden cases ----------------------------------------------------------------------
+
+
+def test_synthetic_tasks_have_enough_hidden_cases_for_the_bug_function(synthetic_build):
+    out, manifest = synthetic_build
+    for t in load_tasks(out / "train.jsonl") + load_tasks(out / "heldout.jsonl"):
+        bug = next(f for f in t.meta["functions"] if f["name"] == t.meta["bug_function"])
+        assert len(bug["hidden_case_indices"]) >= 5
+        assert sum(t.meta["bug_hidden_counts"].values()) == len(bug["hidden_case_indices"])
+        assert len(t.meta["hidden_case_kinds"]) == len(t.hidden_cases)
+        assert t.meta["bug_hidden_counts"].get("generated", 0) > 0
+    assert manifest["augmentation"]["bug_generated_cases"] > 0
+
+
+@has_tasks
+def test_generated_task_set_bug_functions_have_at_least_five_hidden_cases():
+    for t in load_tasks(TASKS / "train.jsonl") + load_tasks(TASKS / "heldout.jsonl"):
+        bug = next(f for f in t.meta["functions"] if f["name"] == t.meta["bug_function"])
+        assert len(bug["hidden_case_indices"]) >= 5, t.task_id
+        kinds = [t.meta["hidden_case_kinds"][i] for i in bug["hidden_case_indices"]]
+        assert kinds.count("generated") == t.meta["bug_hidden_counts"].get("generated", 0)

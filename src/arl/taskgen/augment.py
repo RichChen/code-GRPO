@@ -3,6 +3,9 @@
 Inputs are type-preserving perturbations of one existing case's arguments (ints shifted by a small
 amount, negated or zeroed; strings, lists and tuples with an item inserted, deleted or swapped,
 truncated or emptied; nested structure kept). Containers grow by at most ``MAX_EXTRA_LEN``.
+Candidates must keep the invariants that hold across the function's ``kind="test"`` arguments
+(non-negative / positive ints, ints equal to another argument's ``len()`` which are recomputed
+rather than perturbed, non-empty sequences, sorted sequences, equal-length sequence pairs).
 
 Each candidate input runs twice against the original code in the sandbox. It is kept only if both
 runs return the same value without raising or timing out, and the value survives a ``repr`` /
@@ -26,7 +29,7 @@ from arl.taskgen.validate import SCREEN_CONFIG, run_calls, run_jobs
 
 MAX_GENERATED = 10
 N_CANDIDATES = 25
-MAX_ATTEMPTS = 400
+MAX_ATTEMPTS = 1000
 MAX_EXTRA_LEN = 5
 MAX_ARGS_CHARS = 500
 MAX_EXPECTED_CHARS = 500
@@ -186,24 +189,144 @@ class Perturber:
             out = {}
         return out
 
-    def args(self, seed: Args) -> Args:
+    def args(self, seed: Args, frozen: frozenset[Slot] = frozenset()) -> Args:
         pos, kw = list(seed[0]), list(seed[1])
-        slots = list(range(len(pos) + len(kw)))
+        slots = [s for s in _slots_of((pos, kw)) if s not in frozen]
         if not slots:
             return seed
         n = 2 if len(slots) > 1 and self.rng.random() < 0.3 else 1
-        for i in self.rng.sample(slots, n):
-            if i < len(pos):
-                pos[i] = self.value(pos[i])
-            else:
-                k, val = kw[i - len(pos)]
-                kw[i - len(pos)] = (k, self.value(val))
-        return pos, kw
+        out = (pos, kw)
+        for s in self.rng.sample(slots, n):
+            out = _set(out, s, self.value(_get(out, s)))
+        return out
 
 
-def candidate_inputs(fn: SourceFunction, n: int = N_CANDIDATES) -> list[str]:
-    """Up to ``n`` distinct perturbed argument lists, none equal to an existing case's arguments."""
-    seeds = []
+# -- input invariants -------------------------------------------------------------------------------
+
+Slot = tuple[str, object]  # ("p", index) or ("k", name)
+INVARIANTS = ("int_nonnegative", "int_positive", "len_of", "nonempty", "ascending", "descending", "equal_length")
+
+
+def _slots_of(args: Args) -> list[Slot]:
+    return [("p", i) for i in range(len(args[0]))] + [("k", k) for k, _ in args[1]]
+
+
+def _get(args: Args, slot: Slot) -> Any:
+    if slot[0] == "p":
+        return args[0][slot[1]]
+    return dict(args[1])[slot[1]]
+
+
+def _set(args: Args, slot: Slot, value: Any) -> Args:
+    pos, kw = list(args[0]), list(args[1])
+    if slot[0] == "p":
+        pos[slot[1]] = value
+    else:
+        kw = [(k, value if k == slot[1] else v) for k, v in kw]
+    return pos, kw
+
+
+def _is_int(v: Any) -> bool:
+    return type(v) is int
+
+
+def _is_seq(v: Any) -> bool:
+    return isinstance(v, (list, tuple, str))
+
+
+def _monotone(v: Any, strict_somewhere: bool, ascending: bool) -> bool:
+    if not isinstance(v, (list, tuple)):
+        return False
+    try:
+        pairs = list(zip(v, v[1:]))
+        ok = all((a <= b) if ascending else (a >= b) for a, b in pairs)
+        return ok and (not strict_somewhere or any((a < b) if ascending else (a > b) for a, b in pairs))
+    except TypeError:
+        return False
+
+
+@dataclass
+class Invariants:
+    """Properties that hold for the arguments of every ``kind="test"`` case of a function."""
+
+    int_nonnegative: list[Slot] = field(default_factory=list)
+    int_positive: list[Slot] = field(default_factory=list)
+    len_of: dict[Slot, Slot] = field(default_factory=dict)  # int slot -> sequence slot it is the len() of
+    nonempty: list[Slot] = field(default_factory=list)
+    ascending: list[Slot] = field(default_factory=list)
+    descending: list[Slot] = field(default_factory=list)
+    equal_length: list[tuple[Slot, Slot]] = field(default_factory=list)
+
+    def present(self) -> list[str]:
+        return [name for name in INVARIANTS if getattr(self, name)]
+
+    def apply_len(self, args: Args) -> Args:
+        for j, i in self.len_of.items():
+            args = _set(args, j, len(_get(args, i)))
+        return args
+
+    def violations(self, args: Args) -> list[str]:
+        try:
+            out = []
+            if any(_get(args, s) < 0 for s in self.int_nonnegative):
+                out.append("int_nonnegative")
+            if any(_get(args, s) <= 0 for s in self.int_positive):
+                out.append("int_positive")
+            if any(_get(args, j) != len(_get(args, i)) for j, i in self.len_of.items()):
+                out.append("len_of")
+            if any(len(_get(args, s)) == 0 for s in self.nonempty):
+                out.append("nonempty")
+            if any(not _monotone(_get(args, s), False, True) for s in self.ascending):
+                out.append("ascending")
+            if any(not _monotone(_get(args, s), False, False) for s in self.descending):
+                out.append("descending")
+            if any(len(_get(args, a)) != len(_get(args, b)) for a, b in self.equal_length):
+                out.append("equal_length")
+            return out
+        except (KeyError, IndexError, TypeError):
+            return ["shape"]
+
+
+def infer_invariants(seeds: list[Args]) -> Invariants:
+    inv = Invariants()
+    if not seeds:
+        return inv
+    common = [s for s in _slots_of(seeds[0]) if all(s in _slots_of(a) for a in seeds[1:])]
+    vals = {s: [_get(a, s) for a in seeds] for s in common}
+    ints = [s for s in common if all(_is_int(v) for v in vals[s])]
+    seqs = [s for s in common if all(_is_seq(v) for v in vals[s])]
+    for j in ints:
+        for i in seqs:
+            if all(vj == len(vi) for vj, vi in zip(vals[j], vals[i])):
+                inv.len_of[j] = i
+                break
+    for s in ints:
+        if s in inv.len_of:
+            continue
+        if all(v > 0 for v in vals[s]):
+            inv.int_positive.append(s)
+        elif all(v >= 0 for v in vals[s]):
+            inv.int_nonnegative.append(s)
+    for s in seqs:
+        if all(len(v) > 0 for v in vals[s]):
+            inv.nonempty.append(s)
+        # Ordering only counts if some seed is strictly ordered somewhere; [1, 1] or [x] says nothing.
+        if all(_monotone(v, False, True) for v in vals[s]) and any(_monotone(v, True, True) for v in vals[s]):
+            inv.ascending.append(s)
+        if all(_monotone(v, False, False) for v in vals[s]) and any(_monotone(v, True, False) for v in vals[s]):
+            inv.descending.append(s)
+    for k, a in enumerate(seqs):
+        for b in seqs[k + 1 :]:
+            if all(len(x) == len(y) for x, y in zip(vals[a], vals[b])) and any(len(x) >= 2 for x in vals[a]):
+                inv.equal_length.append((a, b))
+    return inv
+
+
+def candidate_inputs(fn: SourceFunction, n: int = N_CANDIDATES, stats: Counter | None = None) -> list[str]:
+    """Up to ``n`` distinct perturbed argument lists that keep the function's input invariants and
+    differ from every existing case's arguments. Discards are counted in ``stats``."""
+    stats = Counter() if stats is None else stats
+    seeds, test_seeds = [], []
     seen = set()
     for c in fn.cases:
         key = canonical(c.args)
@@ -211,22 +334,34 @@ def candidate_inputs(fn: SourceFunction, n: int = N_CANDIDATES) -> list[str]:
             continue
         seen.add(key)
         seeds.append(parse_args(c.args))
+        if c.kind == "test":
+            test_seeds.append(seeds[-1])
     if not seeds:
         return []
+    inv = infer_invariants(test_seeds)
+    for name in inv.present():
+        stats[f"functions_with:{name}"] += 1
     rng = random.Random(f"augment-{fn.source_id}")
     perturb = Perturber(rng)
+    frozen = frozenset(inv.len_of)
     out: list[str] = []
     for _ in range(MAX_ATTEMPTS):
         if len(out) >= n:
             break
         try:
-            args = perturb.args(rng.choice(seeds))
+            args = inv.apply_len(perturb.args(rng.choice(seeds), frozen))
             text = render_args(args)
-        except (TypeError, ValueError, RecursionError):
+        except (TypeError, ValueError, RecursionError, KeyError, IndexError):
             continue
         if len(text) > MAX_ARGS_CHARS or canonical(text) != text or text in seen:
             continue
         seen.add(text)
+        bad = inv.violations(args)
+        if bad:
+            stats["discard:invariant"] += 1
+            for name in bad:
+                stats[f"invariant_discard:{name}"] += 1
+            continue
         out.append(text)
     return out
 
@@ -278,7 +413,7 @@ def augment_function(fn: SourceFunction, config: SandboxConfig = SCREEN_CONFIG) 
         cases = kept
     fn = replace(fn, cases=cases)
 
-    candidates = candidate_inputs(fn)
+    candidates = candidate_inputs(fn, stats=stats)
     stats["candidates"] += len(candidates)
     if not candidates:
         return AugmentResult(fn, stats)

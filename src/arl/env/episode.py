@@ -22,6 +22,13 @@ from arl.env.tools import TOOL_SCHEMAS, ToolArgumentError, Toolbox, parse_argume
 Message = dict[str, Any]
 Policy = Callable[[list[Message], list[dict[str, Any]]], Message]
 
+
+class PolicyContextExceeded(Exception):
+    """Raised by a policy when the serving side rejects the conversation as too long.
+
+    The episode then stops with ``stop_reason="context_limit"`` and ``truncated=True`` and is graded.
+    """
+
 TOOL_RESULT_MAX_CHARS = 4000
 CONTEXT_MAX_TOKENS = 8000
 CHARS_PER_TOKEN = 4
@@ -157,7 +164,12 @@ def run_episode(
             if estimate_tokens(messages) > context_max_tokens:
                 stop_reason, truncated = "context_limit", True
                 break
-            reply = _normalize_assistant(policy([dict(m) for m in messages], TOOL_SCHEMAS), turns)
+            try:
+                raw = policy([dict(m) for m in messages], TOOL_SCHEMAS)
+            except PolicyContextExceeded:
+                stop_reason, truncated = "context_limit", True
+                break
+            reply = _normalize_assistant(raw, turns)
             turns += 1
             messages.append(reply)
             if not reply.get("tool_calls"):
@@ -200,6 +212,22 @@ def run_episode(
     finally:
         if not keep_workspace:
             shutil.rmtree(workspace, ignore_errors=True)
+
+
+def replay_workspace(task: Task, result: EpisodeResult, dest: str | Path) -> Path:
+    """Rebuild the episode's final workspace in ``dest`` by replaying its successful ``edit_file`` calls.
+
+    ``edit_file`` is the only tool that changes files, and it is deterministic, so this reproduces
+    exactly what was graded.
+    """
+    dest = task.materialize(dest)
+    toolbox = Toolbox(dest)
+    for rec in result.tool_calls:
+        if rec.name == "edit_file" and rec.ok:
+            out = toolbox.call("edit_file", rec.arguments)
+            if not out.ok:
+                raise RuntimeError(f"replay of {rec.call_id} failed: {out.content}")
+    return dest
 
 
 def write_jsonl(results: Iterable[EpisodeResult], path: str | Path) -> None:
