@@ -1,0 +1,240 @@
+{
+  "seed": 0,
+  "config": {
+    "heldout_fraction": 0.3,
+    "max_per_function_bug": 2,
+    "case_timeout_s": 1.0,
+    "modules_per_task": [
+      3,
+      5
+    ],
+    "functions_per_module": [
+      2,
+      4
+    ],
+    "limit_functions": null
+  },
+  "raw_files": {
+    "mbpp": {
+      "url": "https://raw.githubusercontent.com/google-research/google-research/f82046ba5aabbbb427dbfd38a254d26bff08b533/mbpp/sanitized-mbpp.json",
+      "sha256": "ca95deaa9a01ef0a6f439f88bcf0dd3db3563d22f22aad6cae04ebb9a8d8c8e9"
+    },
+    "humaneval": {
+      "url": "https://raw.githubusercontent.com/openai/human-eval/d321ec0b6c23dec317337be99f6d0c45ca73f3d5/data/HumanEval.jsonl.gz",
+      "sha256": "b796127e635a67f93fb35c04f4cb03cf06f38c8072ee7cee8833d7bee06979ef"
+    }
+  },
+  "counts": {
+    "train": 1455,
+    "heldout": 691,
+    "total": 2146
+  },
+  "bug_types": {
+    "train": {
+      "arith_swap": 301,
+      "compare_swap": 178,
+      "const_off_by_one": 389,
+      "bool_swap": 55,
+      "var_swap": 316,
+      "remove_branch": 216
+    },
+    "heldout": {
+      "arith_swap": 132,
+      "compare_swap": 101,
+      "const_off_by_one": 185,
+      "bool_swap": 26,
+      "var_swap": 135,
+      "remove_branch": 112
+    }
+  },
+  "pass_rate_by_bug_type": {
+    "arith_swap": {
+      "mutants_generated": 848,
+      "mutants_passing_screening": 708,
+      "screening_pass_rate": 0.835,
+      "tasks_validated": 433,
+      "tasks_passing_validation": 433,
+      "validation_pass_rate": 1.0,
+      "final_tasks": 433
+    },
+    "compare_swap": {
+      "mutants_generated": 525,
+      "mutants_passing_screening": 344,
+      "screening_pass_rate": 0.655,
+      "tasks_validated": 279,
+      "tasks_passing_validation": 279,
+      "validation_pass_rate": 1.0,
+      "final_tasks": 279
+    },
+    "const_off_by_one": {
+      "mutants_generated": 3344,
+      "mutants_passing_screening": 2146,
+      "screening_pass_rate": 0.642,
+      "tasks_validated": 574,
+      "tasks_passing_validation": 574,
+      "validation_pass_rate": 1.0,
+      "final_tasks": 574
+    },
+    "bool_swap": {
+      "mutants_generated": 121,
+      "mutants_passing_screening": 92,
+      "screening_pass_rate": 0.76,
+      "tasks_validated": 81,
+      "tasks_passing_validation": 81,
+      "validation_pass_rate": 1.0,
+      "final_tasks": 81
+    },
+    "var_swap": {
+      "mutants_generated": 2403,
+      "mutants_passing_screening": 1752,
+      "screening_pass_rate": 0.729,
+      "tasks_validated": 451,
+      "tasks_passing_validation": 451,
+      "validation_pass_rate": 1.0,
+      "final_tasks": 451
+    },
+    "remove_branch": {
+      "mutants_generated": 716,
+      "mutants_passing_screening": 432,
+      "screening_pass_rate": 0.603,
+      "tasks_validated": 328,
+      "tasks_passing_validation": 328,
+      "validation_pass_rate": 1.0,
+      "final_tasks": 328
+    }
+  },
+  "source_functions": {
+    "loaded": 540,
+    "usable_after_screening": 539,
+    "by_split": {
+      "train": 377,
+      "heldout": 162
+    },
+    "by_dataset_usable": {
+      "humaneval": 147,
+      "mbpp": 392
+    }
+  },
+  "bug_sources_by_dataset": {
+    "train": {
+      "humaneval": 494,
+      "mbpp": 961
+    },
+    "heldout": {
+      "humaneval": 275,
+      "mbpp": 416
+    }
+  },
+  "distinct_bug_functions": {
+    "train": 321,
+    "heldout": 140
+  },
+  "issue_templates": {
+    "returns_c": 589,
+    "returns_b": 594,
+    "returns_a": 615,
+    "wrong_no_actual": 3,
+    "raises": 336,
+    "long_input": 9
+  },
+  "discards": {
+    "function_screening": {
+      "original_timeout": 1
+    },
+    "mutant_generated": {
+      "arith_swap": 848,
+      "compare_swap": 525,
+      "const_off_by_one": 3344,
+      "bool_swap": 121,
+      "var_swap": 2403,
+      "remove_branch": 716
+    },
+    "mutant_screening": {
+      "arith_swap:crashed": 1,
+      "arith_swap:no_case_fails": 64,
+      "arith_swap:ok": 708,
+      "arith_swap:only_one_case_fails": 54,
+      "arith_swap:timeout": 21,
+      "bool_swap:no_case_fails": 11,
+      "bool_swap:ok": 92,
+      "bool_swap:only_one_case_fails": 16,
+      "bool_swap:timeout": 2,
+      "compare_swap:no_case_fails": 120,
+      "compare_swap:ok": 344,
+      "compare_swap:only_one_case_fails": 53,
+      "compare_swap:timeout": 8,
+      "const_off_by_one:no_case_fails": 724,
+      "const_off_by_one:ok": 2146,
+      "const_off_by_one:only_one_case_fails": 411,
+      "const_off_by_one:timeout": 63,
+      "remove_branch:no_case_fails": 127,
+      "remove_branch:ok": 432,
+      "remove_branch:only_one_case_fails": 145,
+      "remove_branch:timeout": 12,
+      "var_swap:no_case_fails": 307,
+      "var_swap:ok": 1752,
+      "var_swap:only_one_case_fails": 289,
+      "var_swap:timeout": 55
+    },
+    "task_validation": {
+      "arith_swap:ok": 433,
+      "bool_swap:ok": 81,
+      "compare_swap:ok": 279,
+      "const_off_by_one:ok": 574,
+      "remove_branch:ok": 328,
+      "var_swap:ok": 451
+    },
+    "assertion_split": {
+      "functions_total": {
+        "humaneval": 164,
+        "mbpp": 427
+      },
+      "functions_kept": {
+        "humaneval": 147,
+        "mbpp": 393
+      },
+      "function_discards": {
+        "humaneval:fewer_than_3_cases": 17,
+        "mbpp:fewer_than_3_cases": 34
+      },
+      "assert_total": {
+        "humaneval": 1196,
+        "mbpp": 1324
+      },
+      "assert_kept": {
+        "humaneval": 1037,
+        "mbpp": 1217
+      },
+      "assert_discards": {
+        "humaneval:args_not_literal": 17,
+        "humaneval:assignment": 5,
+        "humaneval:call_wrapped_or_other_function": 10,
+        "humaneval:duplicate_call": 4,
+        "humaneval:expected_not_literal": 1,
+        "humaneval:float_inside_container": 18,
+        "humaneval:import": 9,
+        "humaneval:is": 6,
+        "humaneval:loop": 5,
+        "humaneval:not": 18,
+        "humaneval:not_a_comparison": 60,
+        "humaneval:not_equality": 5,
+        "humaneval:other_statement": 1,
+        "mbpp:call_wrapped_or_other_function": 15,
+        "mbpp:duplicate_call": 1,
+        "mbpp:expected_not_literal": 3,
+        "mbpp:float_inside_container": 27,
+        "mbpp:not": 10,
+        "mbpp:not_a_comparison": 51
+      }
+    }
+  },
+  "timing_s": {
+    "screening": 46.6,
+    "assembly_and_validation": 271.7,
+    "grade_median": 0.496
+  },
+  "files": {
+    "train.jsonl": "86ca767c0b898da3486e4fd2902c683933be1265cb8cdcf88d8a2e77e6a37743",
+    "heldout.jsonl": "3b8c2e036dc9e67fa48ddc7e909f2d09879369c841cc91eaff7cacc6a881327b"
+  }
+}

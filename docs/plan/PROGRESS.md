@@ -130,3 +130,71 @@
 ## CHECKPOINT-1A
 
 第 0–4 步完成，`docs/plan/CHECKPOINT-1A.md` 已写好，全量测试 119 passed。按要求停在这里等待审计，没有开始第 5 步。
+
+## CHECKPOINT-1A 审计后的修改
+
+- 按审计结论把"审计修订 1"原样补进计划第 3 步末尾。
+- 判分 harness 从 `python -I -B` 改成 `python -S -B`（`grader.harness_argv`）：`-I` 隐含 `-E`，会忽略沙箱里设的 `PYTHONHASHSEED=0`，导致字符串集合、字典的迭代顺序每次运行不同，同一份代码的返回值可能忽对忽错。`-S` 仍然跳过 site（不加载 sitecustomize 和 .pth）。加了测试：连跑 4 次输出相同。
+
+## 网络测速（第 5 步之前）
+
+`curl -o /dev/null -s -w '%{time_total}'` 每个地址 3 次取中位数：
+
+| 地址 | 直连 | 经代理 `http://172.29.64.1:7890` |
+| --- | --- | --- |
+| `https://pypi.org/simple/pytest/` | 0.42 s | 0.49 s |
+| `https://mirrors.aliyun.com/pypi/simple/pytest/` | 0.06 s | 0.35 s |
+| `https://pypi.tuna.tsinghua.edu.cn/simple/pytest/` | 0.53 s | 0.48 s |
+| `https://raw.githubusercontent.com/` | 2.2 s（301 跳转） | 0.35 s |
+
+- 代理：Windows 上 Clash 开着，端口 7890 是问用户得到的；宿主 IP 用 `ip route show default` 查到 `172.29.64.1`。
+- PyPI 直连现在已经不慢（第 0 步时单次约 8 秒），所以**没有配置任何镜像**，`~/.config/uv/uv.toml` 和 `UV_DEFAULT_INDEX` 都没设，`pyproject.toml` 和 `uv.lock` 没改。
+- 直连下载 GitHub raw 文件会出现 `Connection reset by peer`，所以数据经代理下载。第 5 步没有新加依赖（下载用 `urllib`）。
+
+## 第 5 步：造题器 `taskgen/`
+
+做了什么：
+- `taskgen/sources.py`：下载并校验原始数据（URL 固定到 commit，校验 sha256，来源和许可证见 `data/raw/SOURCES.md`），按补充要求拆断言。
+  - MBPP 只接受 `assert f(args) == expected`，HumanEval 只接受 `check()` 函数体里的 `assert candidate(args) == expected`。参数和期望值都必须能 `ast.literal_eval`。其他写法丢弃并按原因计数：`loop`、`helper_definition`、`assignment`、`import`、`other_statement`、`not`、`bool_op`、`not_a_comparison`、`chained_comparison`、`is`、`not_equality`、`reversed_comparison`（`expected == f(x)`）、`call_wrapped_or_other_function`、`star_args`、`args_not_literal`、`expected_not_literal`、`float_inside_container`，以及同一函数里的重复调用 `duplicate_call`。
+  - `check` 是 `result == <literal>`；浮点期望值一律用 `math.isclose(result, x, rel_tol=1e-06, abs_tol=1e-09)`。容器里有浮点数的断言没法用一个 `isclose` 表达，丢弃（`float_inside_container`）。
+  - 每个函数至少要有 3 条合格断言。来源解里的 import、辅助函数、类和模块级常量一起保留；有其他顶层语句的解丢弃。
+  - MBPP 的入口函数取测试里调用次数最多、并且在解里定义的那个；HumanEval 是 `entry_point`。
+- `taskgen/mutate.py`：6 类 bug，都是对 AST 的单点修改，用 `ast.walk` 顺序里的节点序号（`position`）加变体名唯一标识，可重放。
+  - `arith_swap`：`+↔-`、`*↔//`（含增量赋值）。
+  - `compare_swap`：`<↔<=`、`>↔>=`、`==↔!=`。
+  - `const_off_by_one`：整数常量 ±1；`range()` 的非常量参数 ±1。
+  - `bool_swap`：`and↔or`、去掉 `not`。
+  - `var_swap`：把一处变量读取换成另一个同类型局部变量。类型由注解、赋值和测试用例的参数值推断，推不出来或有冲突的变量不参与。替换的变量必须在使用处之前已经绑定，推导式变量和嵌套作用域不参与。
+  - `remove_branch`：删掉 `if` 分支（换成 else 部分）、删掉 `else`、删掉非顶层的 `return`。
+  - 只改入口函数的函数体，所以不会在 import 时暴露。变体经 `ast.unparse` 后必须能 `compile`，相同代码去重。
+- `taskgen/validate.py`：两阶段验证。
+  - 筛查：每个来源函数的原始代码和全部变体在沙箱里批量跑，每条用例限时 1 秒。原始代码必须全过；变体必须至少挂 2 条用例（1 条做可见测试，至少 1 条留给隐藏测试），不能超时，不能在 import 时出错。整批卡死或崩溃时，把第一个没有结果的变体判为 timeout/crashed，剩下的重跑。
+  - 整题验证：组装好的题用真正的 `grade()` 验证。参考答案必须奖励 1 且可见测试通过；发布版必须可见测试失败、bug 函数至少一条隐藏用例失败、其他函数的隐藏用例全过、奖励 0。另做静态检查：同一函数的隐藏用例里不能有和可见测试相同的 call；题面不能出现文件路径、`pkg.`、行号，也不能出现 operator、swap、off-by-one 一类暴露 bug 类型的词（只检查反引号以外的文字）。
+- `taskgen/build.py`：
+  - 按来源函数划分 train/heldout（`split-{seed}` 打乱，30% 留出），干扰函数只从同一侧的池子里取，`check_no_leakage` 在写盘前检查，测试也会检查。
+  - 每道题是一个小包：3–5 个模块，每个模块 2–4 个函数，模块名从 12 个中性名字里取。bug 函数放在第一个模块（模块内顺序打乱）。顶层名字在全包内唯一，冲突（包括和内置名重名）时按固定规则改成 `name_{k}`，题面、可见测试和隐藏用例一起改；同一模块里同名但不同的 import 冲突时，换一个干扰函数。
+  - 可见测试：每个函数一条断言，写成 `from pkg import <modules>` 加 `module.func(args)`，避免名字叫 `test_*` 的来源函数被 pytest 收集。bug 函数的可见用例是第一条失败的用例。
+  - 隐藏用例覆盖包里所有函数（各自去掉可见用例），用来发现修 bug 时改坏别的函数。
+  - 题面：英文模板，包含调用、实际输出和期望输出（异常时写异常类型），不带模块前缀。
+  - 每个（函数，bug 类型）最多 2 道题且位置不同（计划原文要求）。
+  - 输出 `data/tasks/{train,heldout}.jsonl` 和 `manifest.json`。构建是确定性的：连续 3 次构建，两个 jsonl 的 sha256 完全相同。
+- `taskgen/report.py`：CHECKPOINT 用的报告脚本，见 `CHECKPOINT-1B.md`。
+- `.gitignore` 加了 `data/tasks/*.jsonl`（约 27MB，可用固定 seed 重新生成，sha256 记在 manifest）。`data/raw/` 下的原始文件（约 300KB）和 `manifest.json` 提交。
+
+结果：
+- **候选题 2146 道（train 1455、heldout 691），少于计划要求的 2500。** 按计划原文"凑不到 2500 道候选，就停下报告，不要自行换别的数据源"，在 CHECKPOINT-1B 停下报告，没有换数据源，也没有放宽筛选或上限。
+- 每个（函数，bug 类型）上限为 2 时，筛查后理论最多就是 2146 道，实际产出也是 2146 道，组装和整题验证没有损失（整题验证通过率 100%）。
+
+测试结果：`uv run pytest -q` → 169 passed（约 36 秒）。新增 `tests/test_taskgen.py` 49 个。
+
+遇到的问题：
+- 来源函数名叫 `test_duplicate` 时，可见测试 `from pkg.x import test_duplicate` 会让 pytest 把它当成测试收集。改成导入模块、用 `module.func()` 调用。
+- MBPP 里有个解定义了 `sum`，和同模块里 HumanEval 函数使用的内置 `sum` 冲突，导致原始代码过不了隐藏用例。改名时把内置名也视为已占用。
+- 题面静态检查最初对函数名（`swap_List`）和参数值（`'1/6'`）误报，改成只检查反引号以外的文字。
+- `var_swap` 的类型推断对 `c = 0; c = c + 1` 这种自引用推不出类型。改成乐观迭代：迭代时忽略未知，最后一轮要求所有绑定类型一致才算确定。
+- HumanEval 的 LICENSE 是在 `d321ec0` 才加进仓库的，固定 commit 从 `463c980` 改成 `d321ec0`，数据文件 sha256 不变。
+- `mbpp/123` 的原始代码在给定参数下超过 1 秒（O(n²)，参数 9999），整函数丢弃。
+
+## CHECKPOINT-1B
+
+第 5 步完成，`docs/plan/CHECKPOINT-1B.md` 已写好。候选题 2146 道，少于 2500，按计划停下报告，列出了可选方案，等审计方决定。没有开始第 6 步。
