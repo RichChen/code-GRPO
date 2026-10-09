@@ -1,4 +1,8 @@
-"""Source functions from MBPP (sanitized) and HumanEval, with their assertions split into cases.
+"""Source functions from MBPP and HumanEval, with their assertions split into cases.
+
+MBPP task ids covered by the sanitized release use its code and tests; the remaining ids come
+from the full release (dropped if they need ``test_setup_code``). ``challenge_test_list`` asserts
+of the full release become hidden-only cases.
 
 Only the plain form ``assert f(args) == expected`` (MBPP) / ``assert candidate(args) == expected``
 (HumanEval) is accepted, where every argument and ``expected`` can be evaluated with
@@ -24,6 +28,12 @@ RAW_FILES = {
         "f82046ba5aabbbb427dbfd38a254d26bff08b533/mbpp/sanitized-mbpp.json",
         "sha256": "ca95deaa9a01ef0a6f439f88bcf0dd3db3563d22f22aad6cae04ebb9a8d8c8e9",
     },
+    "mbpp_full": {
+        "file": "mbpp.jsonl",
+        "url": "https://raw.githubusercontent.com/google-research/google-research/"
+        "f82046ba5aabbbb427dbfd38a254d26bff08b533/mbpp/mbpp.jsonl",
+        "sha256": "ccf64ceae9c5403bf50a044cb6d505bfd2a2963ee58338ba268fd65beab92a9f",
+    },
     "humaneval": {
         "file": "HumanEval.jsonl.gz",
         "url": "https://raw.githubusercontent.com/openai/human-eval/"
@@ -34,6 +44,7 @@ RAW_FILES = {
 MIN_CASES = 3
 FLOAT_CHECK = "math.isclose(result, {expected}, rel_tol=1e-06, abs_tol=1e-09)"
 ALLOWED_TOPLEVEL = (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.ClassDef, ast.Assign, ast.AnnAssign)
+CASE_KINDS = ("test", "challenge", "generated")  # only "test" cases may become the visible test
 
 
 @dataclass(frozen=True)
@@ -41,6 +52,7 @@ class Case:
     args: str  # source of the argument list, e.g. "'Abc', 2"
     expected: str  # source of the expected literal
     is_float: bool
+    kind: str = "test"
 
     def check(self) -> str:
         if self.is_float:
@@ -56,14 +68,19 @@ class SourceFunction:
     source_id: str  # "mbpp/2", "humaneval/0"
     entry: str
     code: str  # normalised module source: imports, helpers and the entry function
-    cases: list[Case]
+    cases: list[Case]  # ordered by kind: test, challenge, generated
+    origin: str = ""  # "mbpp_sanitized" | "mbpp_full" | "humaneval"
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "SourceFunction":
-        return cls(source_id=d["source_id"], entry=d["entry"], code=d["code"], cases=[Case(**c) for c in d["cases"]])
+        return cls(source_id=d["source_id"], entry=d["entry"], code=d["code"],
+                   cases=[Case(**c) for c in d["cases"]], origin=d.get("origin", ""))
+
+    def count(self, kind: str) -> int:
+        return sum(1 for c in self.cases if c.kind == kind)
 
 
 @dataclass
@@ -128,7 +145,7 @@ def _contains_float(value: object) -> bool:
     return False
 
 
-def parse_assert(stmt: ast.stmt, func_name: str) -> Case:
+def parse_assert(stmt: ast.stmt, func_name: str, kind: str = "test") -> Case:
     """Turn ``assert func_name(args) == expected`` into a ``Case`` or raise ``Discard``."""
     if isinstance(stmt, (ast.For, ast.While)):
         raise Discard("loop")
@@ -174,7 +191,7 @@ def parse_assert(stmt: ast.stmt, func_name: str) -> Case:
     if not is_float and _contains_float(expected):
         raise Discard("float_inside_container")
     parts = [ast.unparse(a) for a in left.args] + [f"{k.arg}={ast.unparse(k.value)}" for k in left.keywords]
-    return Case(args=", ".join(parts), expected=ast.unparse(right), is_float=is_float)
+    return Case(args=", ".join(parts), expected=ast.unparse(right), is_float=is_float, kind=kind)
 
 
 def normalise_module(code: str, entry: str) -> str:
@@ -196,21 +213,23 @@ def normalise_module(code: str, entry: str) -> str:
     return ast.unparse(tree) + "\n"
 
 
-def _split_cases(stmts: list[ast.stmt], func_name: str, origin: str, stats: SourceStats) -> list[Case]:
+def _split_cases(stmts: list[ast.stmt], func_name: str, origin: str, stats: SourceStats,
+                 kind: str = "test", seen_calls: set[str] | None = None) -> list[Case]:
     cases: list[Case] = []
-    seen_calls: set[str] = set()
+    seen_calls = set() if seen_calls is None else seen_calls
+    label = origin if kind == "test" else f"{origin}_{kind}"
     for stmt in stmts:
-        stats.assert_total[origin] += 1
+        stats.assert_total[label] += 1
         try:
-            case = parse_assert(stmt, func_name)
+            case = parse_assert(stmt, func_name, kind)
         except Discard as d:
-            stats.assert_discards[f"{origin}:{d.reason}"] += 1
+            stats.assert_discards[f"{label}:{d.reason}"] += 1
             continue
         if case.args in seen_calls:
-            stats.assert_discards[f"{origin}:duplicate_call"] += 1
+            stats.assert_discards[f"{label}:duplicate_call"] += 1
             continue
         seen_calls.add(case.args)
-        stats.assert_kept[origin] += 1
+        stats.assert_kept[label] += 1
         cases.append(case)
     return cases
 
@@ -222,11 +241,11 @@ def _finish(source_id: str, entry: str, code: str, cases: list[Case], origin: st
     except Discard as d:
         stats.function_discards[f"{origin}:{d.reason}"] += 1
         return None
-    if len(cases) < MIN_CASES:
+    if len(cases) < MIN_CASES or not any(c.kind == "test" for c in cases):
         stats.function_discards[f"{origin}:fewer_than_{MIN_CASES}_cases"] += 1
         return None
     stats.functions_kept[origin] += 1
-    return SourceFunction(source_id=source_id, entry=entry, code=normalised, cases=cases)
+    return SourceFunction(source_id=source_id, entry=entry, code=normalised, cases=cases, origin=origin)
 
 
 def _entry_from_tests(tests: list[ast.stmt], defined: set[str]) -> str | None:
@@ -239,25 +258,47 @@ def _entry_from_tests(tests: list[ast.stmt], defined: set[str]) -> str | None:
     return names.most_common(1)[0][0] if names else None
 
 
-def load_mbpp(path: str | Path, stats: SourceStats) -> list[SourceFunction]:
-    with open(path, encoding="utf-8") as f:
-        records = json.load(f)
-    out = []
-    for rec in records:
-        stmts = []
-        for line in rec["test_list"]:
-            try:
-                stmts.extend(ast.parse(line).body)
-            except SyntaxError:
-                stats.assert_total["mbpp"] += 1
-                stats.assert_discards["mbpp:test_syntax_error"] += 1
+def _parse_lines(lines: list[str], label: str, stats: SourceStats) -> list[ast.stmt]:
+    stmts = []
+    for line in lines:
         try:
-            defined = {s.name for s in ast.parse(rec["code"]).body if isinstance(s, ast.FunctionDef)}
+            stmts.extend(ast.parse(line).body)
+        except SyntaxError:
+            stats.assert_total[label] += 1
+            stats.assert_discards[f"{label}:test_syntax_error"] += 1
+    return stmts
+
+
+def load_mbpp(sanitized_path: str | Path, full_path: str | Path, stats: SourceStats) -> list[SourceFunction]:
+    with open(sanitized_path, encoding="utf-8") as f:
+        sanitized = {rec["task_id"]: rec for rec in json.load(f)}
+    with open(full_path, encoding="utf-8") as f:
+        full = {rec["task_id"]: rec for rec in (json.loads(line) for line in f if line.strip())}
+    missing = set(sanitized) - set(full)
+    if missing:
+        raise ValueError(f"sanitized MBPP ids missing from the full release: {sorted(missing)[:5]}")
+    out = []
+    for task_id in sorted(full):
+        rec = full[task_id]
+        if task_id in sanitized:
+            origin, code, tests = "mbpp_sanitized", sanitized[task_id]["code"], sanitized[task_id]["test_list"]
+        else:
+            origin, code, tests = "mbpp_full", rec["code"], rec["test_list"]
+            if rec.get("test_setup_code", "").strip():
+                stats.functions_total[origin] += 1
+                stats.function_discards[f"{origin}:test_setup_code"] += 1
+                continue
+        stmts = _parse_lines(tests, origin, stats)
+        challenge = _parse_lines(rec.get("challenge_test_list") or [], f"{origin}_challenge", stats)
+        try:
+            defined = {s.name for s in ast.parse(code).body if isinstance(s, ast.FunctionDef)}
         except SyntaxError:
             defined = set()
         entry = _entry_from_tests(stmts, defined) or ""
-        cases = _split_cases(stmts, entry, "mbpp", stats)
-        fn = _finish(f"mbpp/{rec['task_id']}", entry, rec["code"], cases, "mbpp", stats)
+        seen: set[str] = set()
+        cases = _split_cases(stmts, entry, origin, stats, "test", seen)
+        cases += _split_cases(challenge, entry, origin, stats, "challenge", seen)
+        fn = _finish(f"mbpp/{task_id}", entry, code, cases, origin, stats)
         if fn:
             out.append(fn)
     return out
@@ -286,6 +327,6 @@ def load_sources(raw_dir: str | Path) -> tuple[list[SourceFunction], SourceStats
     stats = SourceStats()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", SyntaxWarning)  # invalid escape sequences in a few solutions
-        funcs = load_mbpp(raw_dir / RAW_FILES["mbpp"]["file"], stats)
+        funcs = load_mbpp(raw_dir / RAW_FILES["mbpp"]["file"], raw_dir / RAW_FILES["mbpp_full"]["file"], stats)
         funcs += load_humaneval(raw_dir / RAW_FILES["humaneval"]["file"], stats)
     return funcs, stats

@@ -198,3 +198,23 @@
 ## CHECKPOINT-1B
 
 第 5 步完成，`docs/plan/CHECKPOINT-1B.md` 已写好。候选题 2146 道，少于 2500，按计划停下报告，列出了可选方案，等审计方决定。没有开始第 6 步。
+
+## 第 5b 步（未完成，停下报告）
+
+做了什么：
+- 把"审计修订 2"原样补进计划第 5 步末尾，单独提交。
+- 第 6 步前置检查：`nvidia-smi` 能跑通（RTX 2080 Ti，11264 MiB，驱动 615.78.05，CUDA 13.4）。
+- 下载完整版 MBPP `mbpp.jsonl`（经代理，同一 commit，sha256 已核对，记入 `SOURCES.md`）。
+- `sources.py`：sanitized 版收录的题号用 sanitized 的代码和断言，其余题号用完整版；`test_setup_code` 非空的丢弃；`challenge_test_list` 按同样规则拆断言，作为 `kind="challenge"` 只进隐藏用例。`Case` 新增 `kind` 字段（`test` / `challenge` / `generated`），`SourceFunction` 新增 `origin`。来源函数从 540 个增加到 1070 个（sanitized 393、完整版新增 530、HumanEval 147）。
+- `validate.py`：抽出 `run_calls`（跑一组调用、返回原始结果），`run_jobs` 改为基于它。筛查规则改成：至少挂 1 条 `test` 用例（当可见测试），并且总共至少挂 2 条。
+- 新增 `taskgen/augment.py`（隐藏用例加强，规则按修订 2 第 4 条）和 `taskgen/dedup.py`（近似重复检查，规则按修订 2 第 5 条），都有单元测试。augment 还没接进 `build.py`。
+
+结果：
+- 近似重复检查在 seed 0 的划分上，留出集 321 个函数里有 63 个（19.6%）最大 Jaccard 超过 0.8，超过 10% 门槛，**按修订 2 停下报告**。没有移动函数，没有重建题集，没有开始第 6 步。细节和可选方案在 `CHECKPOINT-1C.md`。
+- 隐藏用例加强在 60 个函数上试跑：59 个补满 10 条，丢弃的主要原因是原始代码在扰动输入上抛异常（候选的 8%）。
+
+测试结果：`uv run pytest -q` → 181 passed（新增 `tests/test_augment_dedup.py` 12 个）。
+
+遇到的问题：
+- 宿主进程的字符串哈希是随机的，`repr(set)` 的元素顺序会变，会让构建不确定。生成用例时改用自己的渲染函数，集合元素排序后输出。
+- Python 3.9 以后 `ast.literal_eval("set()")` 是合法的，空集合可以作为期望值；宿主机求值 `check` 时内置函数可用。

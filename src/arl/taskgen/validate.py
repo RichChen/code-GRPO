@@ -106,18 +106,27 @@ def _decode_outcome(rec: dict[str, Any], check: str) -> CaseOutcome:
     return CaseOutcome(passed=evaluate_check(check, Raised(error), error), actual=f"raises {error}", raised=error)
 
 
-def run_jobs(fn: SourceFunction, codes: list[str], config: SandboxConfig = SCREEN_CONFIG) -> list[JobResult]:
-    """Run each code variant of ``fn`` against ``fn.cases``. Jobs that hang are isolated and skipped."""
-    calls = [c.args for c in fn.cases]
-    checks = [c.check() for c in fn.cases]
-    results: dict[int, JobResult] = {}
-    pending = list(range(len(codes)))
+@dataclass
+class RawJob:
+    status: str  # "ok" | "import_error" | "timeout" | "crashed"
+    records: list[dict[str, Any]] = field(default_factory=list)  # one per call: {"ok", "v"} or {"ok": False, "error"}
+    detail: str | None = None
+
+
+def run_calls(entry: str, jobs: list[tuple[str, list[str]]], config: SandboxConfig = SCREEN_CONFIG) -> list[RawJob]:
+    """Run each ``(code, calls)`` job: exec ``code``, then evaluate ``entry(args)`` for every call.
+
+    All jobs share one sandbox process; a job that hangs or kills the process is isolated and the
+    remaining jobs are rerun. A call exceeding the per-call time limit ends its job as "timeout".
+    """
+    results: dict[int, RawJob] = {}
+    pending = list(range(len(jobs)))
     with tempfile.TemporaryDirectory(prefix="arl-screen-") as tmp:
         ws = Path(tmp)
         (ws / "harness.py").write_text(_SCREEN_HARNESS, encoding="utf-8")
         while pending:
-            jobs = [{"id": i, "code": codes[i], "entry": fn.entry, "calls": calls} for i in pending]
-            (ws / "spec.json").write_text(json.dumps({"jobs": jobs, "limit": CASE_TIMEOUT_S}), encoding="utf-8")
+            spec = [{"id": i, "code": jobs[i][0], "entry": entry, "calls": jobs[i][1]} for i in pending]
+            (ws / "spec.json").write_text(json.dumps({"jobs": spec, "limit": CASE_TIMEOUT_S}), encoding="utf-8")
             run = run_in_sandbox(ws, harness_argv("harness.py", "spec.json"), config)
             for line in run.output.splitlines():
                 try:
@@ -129,29 +138,41 @@ def run_jobs(fn: SourceFunction, codes: list[str], config: SandboxConfig = SCREE
                     continue
                 if "import_error" in rec:
                     status = "timeout" if rec["import_error"] == "Timeout" else "import_error"
-                    results[i] = JobResult(status=status, detail=rec["import_error"])
+                    results[i] = RawJob(status=status, detail=rec["import_error"])
                     continue
                 recs = rec["results"]
                 if recs and recs[-1].get("timeout"):
-                    results[i] = JobResult(status="timeout")
-                    continue
-                try:
-                    outcomes = [_decode_outcome(r, checks[k]) for k, r in enumerate(recs)]
-                except Exception:
-                    results[i] = JobResult(status="crashed", detail="undecodable result")
-                    continue
-                if len(outcomes) != len(calls):
-                    results[i] = JobResult(status="crashed", detail="missing results")
-                    continue
-                results[i] = JobResult(status="ok", outcomes=outcomes)
+                    results[i] = RawJob(status="timeout")
+                elif len(recs) != len(jobs[i][1]):
+                    results[i] = RawJob(status="crashed", detail="missing results")
+                else:
+                    results[i] = RawJob(status="ok", records=recs)
             remaining = [i for i in pending if i not in results]
             if remaining:
                 # The first job without a result is the one that killed or hung the process.
                 culprit = remaining[0]
-                results[culprit] = JobResult(status="timeout" if run.timed_out else "crashed", detail=run.output[-200:])
+                results[culprit] = RawJob(status="timeout" if run.timed_out else "crashed", detail=run.output[-200:])
                 remaining = remaining[1:]
             pending = remaining
-    return [results[i] for i in range(len(codes))]
+    return [results[i] for i in range(len(jobs))]
+
+
+def run_jobs(fn: SourceFunction, codes: list[str], config: SandboxConfig = SCREEN_CONFIG) -> list[JobResult]:
+    """Run each code variant of ``fn`` against ``fn.cases`` and check the results."""
+    calls = [c.args for c in fn.cases]
+    checks = [c.check() for c in fn.cases]
+    out = []
+    for raw in run_calls(fn.entry, [(code, calls) for code in codes], config):
+        if raw.status != "ok":
+            out.append(JobResult(status=raw.status, detail=raw.detail))
+            continue
+        try:
+            outcomes = [_decode_outcome(r, checks[k]) for k, r in enumerate(raw.records)]
+        except Exception:
+            out.append(JobResult(status="crashed", detail="undecodable result"))
+            continue
+        out.append(JobResult(status="ok", outcomes=outcomes))
+    return out
 
 
 @dataclass
@@ -178,13 +199,18 @@ def screen_function(fn: SourceFunction, mutants: list[Mutant], config: SandboxCo
     if not all(o.passed for o in orig.outcomes):
         return FunctionScreen(fn, False, "original_fails_cases", [])
     verdicts = []
+    is_test = [c.kind == "test" for c in fn.cases]
     for m, r in zip(mutants, results[1:]):
         if r.status != "ok":
             verdicts.append(MutantVerdict(m, False, r.status, []))
             continue
         failing = sum(1 for o in r.outcomes if not o.passed)
+        failing_test = sum(1 for o, t in zip(r.outcomes, is_test) if t and not o.passed)
+        # One failing "test" case becomes the visible test; at least one more must stay hidden.
         if failing == 0:
             reason = "no_case_fails"
+        elif failing_test == 0:
+            reason = "no_visible_candidate_fails"
         elif failing == 1:
             reason = "only_one_case_fails"
         else:
