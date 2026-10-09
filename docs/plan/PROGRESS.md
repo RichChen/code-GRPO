@@ -106,3 +106,23 @@
 - 一开始把 `pkg/conftest.py` 也列为劫持场景，但 pytest 跑 `tests/` 时根本不会加载它，所以测试前提不成立，删掉了这个参数。
 - 有一次测试结果是旧代码的：测试进程在编辑器写完文件之前就启动了，重跑即正常，不是代码问题。
 - 隐藏用例在同一个进程里顺序执行，没有单条超时；一条死循环会让整次运行超时，`hidden_pass_count` 只统计超时前完成的用例。奖励不受影响（反正是 0）。
+
+## 第 4 步：Episode 循环 `env/episode.py`
+
+做了什么：
+- `run_episode(task, policy, max_turns=8, *, sandbox=None, context_max_tokens=8000, workspace_dir=None, keep_workspace=False) -> EpisodeResult`。`policy(messages, tools) -> assistant message`，OpenAI chat 格式；传给 policy 的是消息的浅拷贝，policy 改了也不影响记录。
+- system prompt 在 `src/arl/env/prompt.md`（215 词，英文），说明任务、五个工具、工作步骤和"改好就停：不调工具的回复即提交"；还说明了隐藏测试用不同输入、只改 `pkg/`。user 消息是 `Fix this issue:\n\n{issue}`。已确认 `prompt.md` 会被打进 wheel。
+- 一次 policy 调用算一轮。结束条件：回复里没有 tool_calls（`stop_reason="submitted"`）；用满 `max_turns`（`"max_turns"`）；每轮调用 policy 之前估算上下文超过 8k token（`"context_limit"`，`truncated=True`）。三种情况都照常判分。用满轮数时如果最终上下文也超过 8k，同样标 `truncated=True`。
+- 上下文估算：消息 content、tool call 的函数名和参数、外加工具 schema 的 JSON，总字符数 ÷ 4。工具 schema 也算进去，因为 chat template 会把它放进上下文（约 600 token）。
+- 每条工具结果按头尾保留截断到 4000 字符。
+- assistant 消息做规范化：只保留 `role`、`content`、`tool_calls`；缺 id 的补 `call_{turn}_{k}`；dict 形式的 arguments 转成 JSON 字符串。tool 消息带 `tool_call_id` 和 `name`。一条回复里可以有多个并行工具调用。
+- 每个工具调用记一条 `ToolCallRecord(turn, call_id, name, arguments, ok, error_kind, output_chars, output_truncated)`。`error_kind`：`unknown_tool`、`invalid_json`、`invalid_arguments`、`malformed_call`（缺函数名）算格式错误，`EpisodeResult.format_errors` 统计这四类；`tool_error` 是格式对但执行失败（如文件不存在），不算格式错误。
+- `EpisodeResult` 字段：`task_id`、`messages`（完整列表）、`tool_calls`、`reward`、`grade`（`GradeResult` 的 dict）、`turns`、`stop_reason`、`truncated`、`context_tokens_est`、`duration_s`、`meta`（题目的分析字段）。`to_json()` / `from_dict()` 可往返，`write_jsonl(results, path)` 追加写。
+- 工作区用 `tempfile.mkdtemp(prefix="arl-ep-")`，结束后删除（`keep_workspace=True` 可保留）。
+- `ScriptedPolicy(turns)`：按预设顺序回放工具调用或最终回答，放在 `episode.py` 里，第 5 步的检查点也要用。
+- 端到端测试：脚本化 policy 按"列目录、搜索、读文件、改文件、跑测试、提交"修好题目，奖励 1；只改可见测试的 policy 让 `run_tests` 显示通过，但奖励 0；直接提交奖励 0。另测了消息格式、policy 拿到的是拷贝和工具 schema、`max_turns`、一轮多个工具调用、各类格式错误（记录后 episode 继续）、参数规范化、工具输出截断、上下文超限时截断但仍判分（先修好再刷屏读文件，`truncated=True` 且奖励 1）、工作区清理、JSONL 往返、token 估算。
+
+测试结果：`uv run pytest -q` → 119 passed（约 28 秒）。
+
+遇到的问题：
+- 编辑器写入的文件偶尔要过一两秒才在 WSL 里可见，立刻跑 pytest 会报文件不存在或跑到旧内容，等一下重跑即可。不是代码问题。
