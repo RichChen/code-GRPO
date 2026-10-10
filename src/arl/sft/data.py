@@ -5,7 +5,8 @@
     PYTHONPATH=src ~/.venvs/vllm/bin/python -m arl.sft.data crosscheck --url http://127.0.0.1:8000
 
 Rendering needs the Qwen3 tokenizer and vLLM's hermes tool parser, so it runs in the vLLM venv (the same
-transformers that renders prompts at inference); the filter is plain Python.
+transformers that renders prompts at inference); the filter is plain Python. ``Renderer`` itself only needs
+transformers and is also the prompt renderer of the token-level rollout client (``arl.rollout.tokenclient``).
 
 One training sample per assistant turn. Qwen3's template drops the empty think block from earlier assistant
 turns, while the generation prompt with ``enable_thinking=False`` ends in ``<think>\\n\\n</think>\\n\\n``. A
@@ -113,6 +114,20 @@ def split_val(trajectories: list[dict[str, Any]], tasks: dict[str, Task], seed: 
 # -- rendering ---------------------------------------------------------------------------------------
 
 
+def template_arguments(arguments: Any) -> dict[str, Any]:
+    """Tool call arguments as vLLM 0.31 hands them to the chat template (``chat_utils._postprocess_messages``):
+    a JSON object string is parsed; empty, malformed or non-object arguments become ``{}``."""
+    if not arguments:
+        return {}
+    if isinstance(arguments, dict):
+        return arguments
+    try:
+        parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def template_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """The episode's OpenAI-format messages as the chat template sees them (tool arguments parsed to dicts,
     as vLLM does before rendering)."""
@@ -122,7 +137,7 @@ def template_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             msg: dict[str, Any] = {"role": "assistant", "content": m.get("content") or ""}
             if m.get("tool_calls"):
                 msg["tool_calls"] = [{"type": "function", "function": {
-                    "name": c["function"]["name"], "arguments": json.loads(c["function"]["arguments"])}}
+                    "name": c["function"]["name"], "arguments": template_arguments(c["function"]["arguments"])}}
                     for c in m["tool_calls"]]
             out.append(msg)
         elif m["role"] == "tool":
@@ -149,11 +164,18 @@ def assistant_text(message: dict[str, Any]) -> str:
 class Renderer:
     def __init__(self, model: str = MODEL):
         from transformers import AutoTokenizer
-        from vllm.tool_parsers.hermes_tool_parser import Hermes2ProToolParser
 
         self.tok = AutoTokenizer.from_pretrained(model)
-        self.parser = Hermes2ProToolParser(self.tok)
         self.im_end = self.tok.convert_tokens_to_ids(IM_END)
+        self._parser: Any = None
+
+    @property
+    def parser(self) -> Any:
+        if self._parser is None:  # vLLM is only installed in its own venv
+            from vllm.tool_parsers.hermes_tool_parser import Hermes2ProToolParser
+
+            self._parser = Hermes2ProToolParser(self.tok)
+        return self._parser
 
     def render(self, messages: list[dict[str, Any]], generation_prompt: bool) -> str:
         return self.tok.apply_chat_template(messages, tools=TOOL_SCHEMAS, add_generation_prompt=generation_prompt,

@@ -10,8 +10,6 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
-import openai
-
 from arl.env.episode import Message, PolicyContextExceeded
 
 TOOL_CALL_MARKER = re.compile(r"<tool_call>|\"name\"\s*:\s*\"(read_file|search_code|list_dir|edit_file|run_tests)\"")
@@ -55,6 +53,14 @@ class ClientConfig:
     trust_env: bool = False
     # CNY per million tokens: {"cache_hit": ..., "cache_miss": ..., "output": ...}
     price_cny_per_mtok: dict[str, float] | None = None
+    # "chat": /v1/chat/completions (OpenAIPolicy); "tokens": /v1/completions with token ids in and out
+    # (arl.rollout.tokenclient.TokenPolicy), prompts rendered locally with this tokenizer
+    endpoint: str = "chat"
+    tokenizer: str = "Qwen/Qwen3-1.7B"
+    # None: the server's default (the model's generation_config); 0 disables top-k
+    top_k: int | None = None
+    # tokens endpoint only: compare every rendered prompt with the server's /tokenize
+    verify_tokenize: bool = False
 
     @classmethod
     def load(cls, path: str | Path | None = None, dotenv: str | Path = DOTENV, **overrides: Any) -> "ClientConfig":
@@ -120,6 +126,9 @@ class OpenAIPolicy:
     """
 
     def __init__(self, config: ClientConfig, client: Any | None = None, seed: int | None = None):
+        import openai  # not installed in the training venv, which only uses the token-level client
+
+        self.openai = openai
         self.config = config
         self.client = client or openai.OpenAI(
             base_url=config.base_url, api_key=config.api_key, timeout=config.timeout_s, max_retries=0,
@@ -142,11 +151,12 @@ class OpenAIPolicy:
         for attempt in range(self.config.retries + 1):
             try:
                 return self.client.chat.completions.create(**kwargs)
-            except openai.BadRequestError as exc:
+            except self.openai.BadRequestError as exc:
                 if _is_context_error(exc):
                     raise PolicyContextExceeded(str(exc)) from exc
                 raise
-            except (openai.APIConnectionError, openai.APITimeoutError, openai.InternalServerError, openai.RateLimitError):
+            except (self.openai.APIConnectionError, self.openai.APITimeoutError, self.openai.InternalServerError,
+                    self.openai.RateLimitError):
                 if attempt == self.config.retries:
                     raise
                 time.sleep(delay)

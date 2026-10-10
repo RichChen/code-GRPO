@@ -79,10 +79,38 @@ def behaviour(result: EpisodeResult) -> dict[str, Any]:
     }
 
 
-def episode_record(task: Task, k: int, result: EpisodeResult, policy: OpenAIPolicy, session: str,
-                   started: float, with_messages: bool = False) -> dict[str, Any]:
+def make_policy(config: ClientConfig, seed: int | None) -> Any:
+    """``OpenAIPolicy`` for the chat endpoint, ``TokenPolicy`` for ``endpoint: "tokens"``."""
+    if config.endpoint == "tokens":
+        from arl.rollout.tokenclient import TokenPolicy
+
+        return TokenPolicy(config, seed=seed)
+    if config.endpoint != "chat":
+        raise ValueError(f"unknown endpoint {config.endpoint!r}")
+    return OpenAIPolicy(config, seed=seed)
+
+
+def token_stats(policy: Any, with_tokens: bool = False) -> dict[str, Any]:
+    """Per-turn token data of a ``TokenPolicy`` episode (lengths always, the token ids on request)."""
+    if not hasattr(policy, "tokenize_checked"):
+        return {}
+    turns = policy.turns
+    out: dict[str, Any] = {
+        "turn_prompt_tokens": [len(t["prompt_ids"]) for t in turns],
+        "turn_completion_tokens": [len(t["completion_ids"]) for t in turns],
+        "tokenize_checked": policy.tokenize_checked,
+        "tokenize_mismatches": policy.tokenize_mismatches,
+    }
+    if with_tokens:
+        out["turn_tokens"] = turns
+    return out
+
+
+def episode_record(task: Task, k: int, result: EpisodeResult, policy: Any, session: str,
+                   started: float, with_messages: bool = False, with_tokens: bool = False) -> dict[str, Any]:
     u = policy.usage
     extra = {"messages": result.messages} if with_messages else {}
+    extra.update(token_stats(policy, with_tokens))
     return {
         "task_id": task.task_id,
         "k": k,
@@ -189,11 +217,13 @@ class CostLedger:
 def run_calibration(tasks: list[Task], out_path: Path, config: ClientConfig, k: int = K, concurrency: int = CONCURRENCY,
                     max_turns: int = MAX_TURNS, policy_factory: Callable[[Task, int], Any] | None = None,
                     max_consecutive_errors: int = 20, log: Callable[[str], None] = print,
-                    ledger: CostLedger | None = None, with_messages: bool = False) -> list[dict[str, Any]]:
+                    ledger: CostLedger | None = None, with_messages: bool = False,
+                    with_tokens: bool = False) -> list[dict[str, Any]]:
     """Run every (task, k) episode not yet recorded in ``out_path``; return all records for these tasks.
 
     With a ``ledger``, no new episode starts once the budget would be reached (see ``CostLedger.exhausted``).
-    ``with_messages`` stores the full conversation in each record (SFT trajectories).
+    ``with_messages`` stores the full conversation in each record (SFT trajectories); ``with_tokens`` the
+    token-level client's per-turn token ids and logprobs.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     done = latest(load_records(out_path))
@@ -205,7 +235,7 @@ def run_calibration(tasks: list[Task], out_path: Path, config: ClientConfig, k: 
     stop = threading.Event()
     over_budget = threading.Event()
     in_flight = {"n": 0}
-    factory = policy_factory or (lambda task, i: OpenAIPolicy(config, seed=request_seed(task.task_id, i)))
+    factory = policy_factory or (lambda task, i: make_policy(config, request_seed(task.task_id, i)))
 
     def one(task: Task, i: int) -> dict[str, Any] | None:
         with lock:
@@ -220,7 +250,7 @@ def run_calibration(tasks: list[Task], out_path: Path, config: ClientConfig, k: 
         try:
             policy = factory(task, i)
             result = run_episode(task, policy, max_turns=max_turns)
-            rec = episode_record(task, i, result, policy, session, started, with_messages)
+            rec = episode_record(task, i, result, policy, session, started, with_messages, with_tokens)
         except Exception as exc:  # server errors etc.: record, retry on resume
             rec = {"task_id": task.task_id, "k": i, "session": session,
                    "error": redact(f"{type(exc).__name__}: {exc}", [config.api_key])[:500]}
@@ -363,6 +393,9 @@ def summarize(records: list[dict[str, Any]], tasks: dict[str, Task], k: int = K)
         "finish_reasons": dict(sum((Counter(r["finish_reasons"]) for r in recs), Counter())),
         "mean_episode_s": round(statistics.mean(r["duration_s"] for r in recs), 2) if recs else None,
         "throughput_episodes_per_hour": throughput_per_hour(recs),
+        **({"tokenize_checked": sum(r["tokenize_checked"] for r in recs),
+            "tokenize_mismatches": sum(r["tokenize_mismatches"] for r in recs)}
+           if recs and all("tokenize_checked" in r for r in recs) else {}),
         "diagnostics": diagnostics(recs),
         "by_split": group(lambda t: t.meta["split"]),
         "by_bug_type": group(lambda t: t.meta["bug_type"]),
@@ -486,6 +519,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-turns", type=int, default=MAX_TURNS)
     ap.add_argument("--budget-cny", type=float, default=None, help="paid APIs: stop starting episodes at this spend")
     ap.add_argument("--cost-file", type=Path, default=None, help="cumulative spend (default <runs>/cost.json)")
+    ap.add_argument("--with-messages", action="store_true", help="store the full conversation in each record")
+    ap.add_argument("--with-tokens", action="store_true", help="tokens endpoint: store each turn's token ids")
     a = ap.parse_args(argv)
     cost_file = a.cost_file or a.runs / "cost.json"
 
@@ -520,7 +555,7 @@ def main(argv: list[str] | None = None) -> int:
                 ap.error("--budget-cny is required for a priced (paid) API")
             ledger = CostLedger(cost_file, a.budget_cny, config.price_cny_per_mtok, load_records(path))
         recs = run_calibration(tasks, path, config, k=a.k, concurrency=a.concurrency, max_turns=a.max_turns,
-                               ledger=ledger)
+                               ledger=ledger, with_messages=a.with_messages, with_tokens=a.with_tokens)
     summary = summarize(recs, by_id, a.k)
     (a.runs / f"{name}-summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2, ensure_ascii=False))

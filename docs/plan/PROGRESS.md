@@ -662,3 +662,103 @@ CHECKPOINT-2A 审计通过。审计修订 2A-2 补在 `PHASE-2-SFT.zh-CN.md` 末
 - tag `sft-v1`。
 
 测试结果：`uv run pytest -q` → 233 passed，2 skipped。
+
+## 第 1 步（二）：token 级客户端和一致性检查（贪心比对未达标，停下）
+
+### 实现
+
+- `src/arl/rollout/tokenclient.py`：`TokenPolicy`，接口和 `OpenAIPolicy` 相同（`policy(messages, tools) -> assistant message`）。
+  - prompt 用 `arl.sft.data.Renderer` 在本地渲染成 token id，调 `/v1/completions`。
+  - 每轮记录 `prompt_ids`、`completion_ids`、`completion_logprobs`、`finish_reason`。
+  - 输出用自己的 hermes 解析器 `src/arl/rollout/hermes.py` 解析。
+  - `verify_tokenize: true` 时，每轮把原始消息加 tools 和 `enable_thinking=False` 发给服务端 `/tokenize`，逐个比对。
+- 历史工具调用参数的处理照 vLLM 的 `chat_utils._postprocess_messages`：空串、坏 JSON、非对象一律变成 `{}`（`arl.sft.data.template_arguments`）。
+- `calibrate` 按配置的 `endpoint`（`chat` 或 `tokens`）选客户端；新增 `--with-tokens`，在记录里保存每轮 token id。
+- 新配置：
+  - `configs/sft/v1-eval.json`：评测用，T=0.8，top_k 不设；
+  - `configs/grpo/calibrate-v1.json`：校准和 GRPO 用，T=1.0，`top_k: 0`；
+  - `configs/check/greedy-{chat,tokens}.json`：贪心比对用。
+- `src/arl/rollout/consistency.py`：`ids`、`greedy`、`replay`、`stats` 四个子命令。
+- 运行环境：token 客户端要 transformers（本地分词）和 httpx，不要 openai。
+  - 它跑在 `~/.venvs/vllm` 里，GRPO 训练端在 `~/.venvs/train` 里也能用。
+  - 主 `.venv` 没有 transformers，在主 `.venv` 里跑会报 `ModuleNotFoundError`。
+  - 没有新增依赖。
+
+### vLLM 0.31 接口（查源码，并用实际请求核对）
+
+- **`/v1/completions`**（`CompletionRequest`）：
+  - `prompt` 可以是 `list[int]`。
+  - `return_token_ids: true` 返回 `choices[0].token_ids` 和 `prompt_token_ids`。
+  - `logprobs: 0` 返回所选 token 的 `choices[0].logprobs.token_logprobs`。
+  - `skip_special_tokens` 默认是 true；我们发 false。
+  - `top_k` 不设时用服务端默认值（来自模型的 generation_config）；0 或 -1 表示不截断。
+  - logprob 是采样前的原始 logprob（`--logprobs-mode` 默认 `raw_logprobs`）。
+- **实测**：
+  - `token_ids` 末尾含 `<|im_end|>`（151645），`text` 不含；`token_logprobs` 和 `token_ids` 等长。
+  - 超出上下文时返回 400，消息是 "This model's maximum context length is 8192 tokens…"；两个客户端用同一个判定。
+  - `/tokenize` 返回 `tokens`、`count`、`max_model_len`、`token_strs`。
+  - chat 接口对工具调用轮的 `finish_reason` 是 `tool_calls`，completions 接口一律是 `stop`；calibrate 统计时这个字段两者不可比。
+- **默认采样参数**：chat 和 completions 两个接口都从模型 `generation_config` 取默认值（`get_diff_sampling_param`）。Qwen3 的是 temperature 0.6、top_k 20、top_p 0.95。
+  - 所以之前所有评测实际都用了 top_k=20；temperature 和 top_p 是请求里显式给的。
+  - 决定：
+    - 评测配置不设 top_k，和以前可比；
+    - 校准和 GRPO 显式发 `top_k: 0`，从模型的完整分布采样（修订 2A-2 第 4 条：T=1.0）。
+- **hermes 解析**：`Hermes2ProToolParser.extract_tool_calls`：
+  - 正则 `<tool_call>(.*?)</tool_call>|<tool_call>(.*)`（DOTALL），每块 `json.loads`，参数用 `json.dumps(ensure_ascii=False)` 重新序列化。
+  - 任何异常都当作没有工具调用，全文作为 content。
+  - 有工具调用时，content 取第一个 `<tool_call>` 之前的文本，全是空白就设为 None。
+  - 工具解析器的 `adjust_request` 会把 `skip_special_tokens` 设成 false。
+  - `tests/test_hermes_vllm.py` 在 vLLM 环境里拿 SFT 数据 v2 的 4145 条助手文本加 20 个边界情况，逐条和 vLLM 的解析结果比对：0 处不同。
+- **运行时 LoRA**（第 3 步用）：
+  - 环境变量 `VLLM_ALLOW_RUNTIME_LORA_UPDATING=1`。
+  - `POST /v1/load_lora_adapter {lora_name, lora_path, load_inplace}`，`POST /v1/unload_lora_adapter {lora_name}`。
+  - 启动参数 `--enable-lora --max-lora-rank`（默认 16）、`--max-loras`（默认 1）、`--max-cpu-loras`。
+  - 同一路径原地重载不会让 prefix cache 失效，所以每步换新路径和新名字。
+- **sleep mode**（第 3 步用）：
+  - 启动参数 `--enable-sleep-mode`，会自动启用 cumem 分配器，平台不支持时直接报错。
+  - 接口只在 `VLLM_SERVER_DEV_MODE=1` 时注册：`POST /sleep?level=1|2`、`POST /wake_up?tags=…`、`GET /is_sleeping`。
+  - level 1 把权重卸到 CPU，level 2 直接丢掉。
+  - WSL 上能不能用还没验证。
+
+### 一致性检查
+
+模型：`runs/sft-preview/merged`（fp16），用诊断扫描的 vLLM 参数（`--dtype half --max-model-len 8192 --gpu-memory-utilization 0.85 --seed 0`）。
+
+| 检查 | 要求 | 结果 | |
+| --- | --- | --- | --- |
+| 逐轮比对 | `prompt_ids` 等于 `/tokenize` | 2587 + 66 轮，0 处不一致 | 通过 |
+| 贪心比对 | 10 题里至少 9 题工具调用序列和奖励完全一致 | **7 / 10**（奖励 10 / 10 一致） | **未通过** |
+| 统计比对 | 严格解出率落在 53.5% 的 bootstrap 95% 区间 [45.5%, 61.25%] | 55.25%（400 个 episode，报错 0） | 通过 |
+
+- 统计比对的置信区间：对旧 SFT dev 评测（`runs/sft-eval/dev-sft.jsonl`）的 100 道题的单题解出率做 bootstrap，重采样 10000 次，种子 0。
+  - 新客户端：解出 0–4 次的题数是 25 / 15 / 8 / 18 / 34（旧客户端是 25 / 18 / 7 / 18 / 32）；
+  - 解出 1–3 次的题 41 道（旧 43）；用满 10 轮的 96 个（旧 100）；被提醒过 4.3%（旧 3.7%）。
+- 贪心比对的题目由 `consistency ids` 生成（种子 `greedy-0`，dev 里抽 10 题，存在 `runs/check/greedy_ids.txt`）。两边并发都是 1，K=1。
+
+### 贪心比对的差异分析
+
+- 3 道不一致的题：
+  - `train-humaneval-64-arith_swap-14`、`train-mbpp-278-remove_branch-7`、`train-mbpp-481-compare_swap-13`；
+  - 两边奖励都是 0，只是工具调用序列在第 5 次或第 8 次调用以后分叉。
+- 按渲染后的消息（去掉不进模板的 `tool_call_id`）逐条比：
+  - 6 道题第一处不同都是一条 `run_tests` 的工具输出，在这之前的消息完全相同。
+  - 不同只有两类：pytest 断言信息里的函数内存地址（`<function vowels_count at 0x7537…>` 对 `0x78b6…>`），以下是这处的 diff；以及耗时（`in 0.03s` 对 `0.04s`）。
+    ```
+    -E        +  where 0 = <function vowels_count at 0x753791e16f20>('key')
+    +E        +  where 0 = <function vowels_count at 0x78b6e69725c0>('key')
+    ```
+  - 也就是说，只要跑过一次失败的测试，下一轮的 prompt 就不同了，和用哪个客户端无关。上面 3 道题就是 prompt 不同以后，后面的生成分叉了。
+- **基线：旧客户端自己跟自己比**，同样的 10 题再跑一遍，也是 **7 / 10**。不一致的 3 道里有 2 道和上面相同，分叉原因也一样（`run_tests` 输出里的地址和耗时）。所以在这个环境下，"至少 9 题一致"连旧客户端自己都达不到。
+- **回放比对**（`consistency replay`）：把旧客户端那次运行里每个助手轮之前的完整历史原样交给新客户端做贪心生成，再和旧客户端的回复比。
+  - 65 轮里 64 轮完全一致。
+  - 不一致的 1 轮在 `humaneval-64` 第 6 条消息，只是解释文字不同。再请求同一个历史时，新客户端和 chat 接口各自得到完全相同的 130 个 token，也和记录一致，复现不出来。归为服务端数值上的非确定性（fp16，同一 prompt 在 prefix cache 命中和未命中时走的计算路径不同）。
+- 结论：没有发现渲染或解析上的差异。贪心比对未达标，是因为环境的工具输出本身不确定，不是新客户端的问题。
+- 按要求，硬性检查未通过就停在这里，不进入第 2 步。没有改环境：环境不能改，改了 `phase1-env-v1` 就变了。也没有改比对的判定标准。
+- 原始结果都在 `runs/check/`：
+  - `greedy-report.json`、`greedy-chat-vs-chat.json`、`replay-chat-to-tokens.json`、`stats-report.json`；
+  - 运行记录 `greedy-{chat,chat2,tokens}.jsonl`、`dev-sft-tokens.jsonl`。
+
+测试结果：
+- `uv run pytest -q` → 257 passed，3 skipped；
+- `~/.venvs/vllm` 全量 → 262 passed，1 skipped；
+- `~/.venvs/train` 里跑 `tests/train`、`tests/test_tokenclient.py`、`tests/test_hermes.py` → 26 passed，3 skipped。
