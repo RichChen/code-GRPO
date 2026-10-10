@@ -292,3 +292,11 @@
 ## CHECKPOINT-1C
 
 `docs/plan/CHECKPOINT-1C.md` 已改写为正式版：第 5b 步完成，第 6 步试点触发停止条件，第 7 步未做。原来的提前停下版移到了附录 A。等审计方决定，没有开始阶段 2。
+
+## 审计修订 4 · 第 1 步（上）：冻结题集
+
+- 把"审计修订 4"原样补进计划第 6 步末尾，单独提交（`5358e63`）。同一个提交里加了 `.env.example`，`.gitignore` 加了 `.env`。提交前按要求跑了 `git grep -n "sk-"`：命中 2 处，都不是密钥，一处是 prompt 原文"用 `git grep -n "sk-"` 检查"，另一处是 `grader.py` 注释里的 "task-validation"。另外用 `.env` 里的真实密钥值（没有打印）搜了全部 git 历史和工作区，0 处命中。之后每次提交前都做这两项检查。
+- 题集用 `812d5ce` 构建的版本，没有重建。manifest 新增 `frozen` 字段（tag、构建 commit、两个 jsonl 的 sha256），sha256 和磁盘上的文件核对一致。打 tag `phase1-tasks-v1`。
+- README 补上"生成题集"一节。"接入新 policy"和"启动推理服务"两节和环境修改一起提交，免得 tag 上的 README 描述还没提交的代码。
+
+测试结果：`uv run pytest -q` → 210 passed。

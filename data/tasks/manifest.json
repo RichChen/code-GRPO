@@ -452,5 +452,14 @@
   "files": {
     "train.jsonl": "f0038c46eb4b089daabe68ba7246cf086fe521458a24bc2a82e47b5e7840aa82",
     "heldout.jsonl": "d28e0709bb81af8196837efaec77ed3833d952ea25fcc1d457aa87f15d7cc3d4"
+  },
+  "frozen": {
+    "tag": "phase1-tasks-v1",
+    "built_at_commit": "812d5ce",
+    "files_sha256": {
+      "train.jsonl": "f0038c46eb4b089daabe68ba7246cf086fe521458a24bc2a82e47b5e7840aa82",
+      "heldout.jsonl": "d28e0709bb81af8196837efaec77ed3833d952ea25fcc1d457aa87f15d7cc3d4"
+    },
+    "note": "frozen full task set (no solve-rate selection; see audit revision 4). Rebuild with `python -m arl.taskgen.build --raw data/raw --out data/tasks` and compare files_sha256."
   }
 }
