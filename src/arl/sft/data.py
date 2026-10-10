@@ -32,9 +32,9 @@ from arl.env.tools import TOOL_SCHEMAS
 MODEL = "Qwen/Qwen3-1.7B"
 EPISODES = Path("runs/deepseek-sft/episodes.jsonl")
 TASKS = Path("data/tasks")
-OUT = Path("data/sft/v1")
+OUT = Path("data/sft/v2")
 MAX_TURNS = 8
-MAX_PER_FUNCTION = 3
+MAX_PER_FUNCTION = 5  # audit revision 2A-1; v1 used 3
 VAL_FRACTION = 0.05
 MAX_INCONSISTENT = 0.02
 SEED = 0
@@ -65,9 +65,9 @@ def discard_reason(rec: dict[str, Any]) -> str | None:
     return None
 
 
-def select(records: Iterable[dict[str, Any]], tasks: dict[str, Task], seed: int = SEED
-           ) -> tuple[list[dict[str, Any]], Counter]:
-    """Trajectories passing every filter: at most one per task, at most ``MAX_PER_FUNCTION`` per bug source.
+def select(records: Iterable[dict[str, Any]], tasks: dict[str, Task], seed: int = SEED,
+           max_per_function: int = MAX_PER_FUNCTION) -> tuple[list[dict[str, Any]], Counter]:
+    """Trajectories passing every filter: at most one per task, at most ``max_per_function`` per bug source.
 
     Within a function, candidates are taken in a seeded random order, preferring bug types not yet taken.
     """
@@ -92,7 +92,7 @@ def select(records: Iterable[dict[str, Any]], tasks: dict[str, Task], seed: int 
         taken: list[dict[str, Any]] = []
         for prefer_new_type in (True, False):
             for r in cands:
-                if len(taken) == MAX_PER_FUNCTION or r in taken:
+                if len(taken) == max_per_function or r in taken:
                     continue
                 types = {tasks[t["task_id"]].meta["bug_type"] for t in taken}
                 if not prefer_new_type or tasks[r["task_id"]].meta["bug_type"] not in types:
@@ -207,12 +207,13 @@ def _dist(xs: list[int]) -> dict[str, Any]:
             "mean": round(statistics.mean(s), 1)}
 
 
-def build(episodes: Path, tasks_dir: Path, out: Path, model: str = MODEL, seed: int = SEED) -> dict[str, Any]:
+def build(episodes: Path, tasks_dir: Path, out: Path, model: str = MODEL, seed: int = SEED,
+          max_per_function: int = MAX_PER_FUNCTION) -> dict[str, Any]:
     from arl.rollout.calibrate import latest, load_records
 
     tasks = {t.task_id: t for t in load_tasks(tasks_dir / "train.jsonl")}
     records = list(latest(load_records(episodes)).values())
-    chosen, discards = select(records, tasks, seed)
+    chosen, discards = select(records, tasks, seed, max_per_function)
     renderer = Renderer(model)
     kept: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
     inconsistent: Counter = Counter()
@@ -259,6 +260,8 @@ def build(episodes: Path, tasks_dir: Path, out: Path, model: str = MODEL, seed: 
         "episodes_file": str(episodes),
         "episodes": len(records),
         "selected_before_rendering": checked,
+        "max_per_function": max_per_function,
+        "kept_per_function": dict(sorted(Counter(Counter(tasks[r["task_id"]].meta["bug_source"] for r, _ in kept).values()).items())),
         "discards": {k: discards.get(k, 0) for k in DISCARD_REASONS},
         "inconsistent_by_check": dict(inconsistent),
         "inconsistent_fraction": round(sum(inconsistent.values()) / checked, 4) if checked else None,
@@ -271,14 +274,15 @@ def build(episodes: Path, tasks_dir: Path, out: Path, model: str = MODEL, seed: 
     return stats
 
 
-def crosscheck(episodes: Path, tasks_dir: Path, url: str, model: str = MODEL, seed: int = SEED) -> dict[str, Any]:
+def crosscheck(episodes: Path, tasks_dir: Path, url: str, model: str = MODEL, seed: int = SEED,
+               max_per_function: int = MAX_PER_FUNCTION) -> dict[str, Any]:
     """Compare each kept turn's prefix tokens with what the running vLLM server renders for the same request."""
     import requests
 
     from arl.rollout.calibrate import latest, load_records
 
     tasks = {t.task_id: t for t in load_tasks(tasks_dir / "train.jsonl")}
-    chosen, _ = select(list(latest(load_records(episodes)).values()), tasks, seed)
+    chosen, _ = select(list(latest(load_records(episodes)).values()), tasks, seed, max_per_function)
     renderer = Renderer(model)
     checked, mismatched = 0, []
     for rec in chosen:
@@ -330,6 +334,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--episodes", type=Path, default=EPISODES)
     ap.add_argument("--tasks", type=Path, default=TASKS)
     ap.add_argument("--out", type=Path, default=OUT)
+    ap.add_argument("--max-per-function", type=int, default=MAX_PER_FUNCTION)
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--url", default="http://127.0.0.1:8000")
     a = ap.parse_args(argv)
@@ -337,10 +342,10 @@ def main(argv: list[str] | None = None) -> int:
         print(show(a.out / "train.jsonl", a.n, a.seed, a.model))
         return 0
     if a.command == "crosscheck":
-        r = crosscheck(a.episodes, a.tasks, a.url, a.model)
+        r = crosscheck(a.episodes, a.tasks, a.url, a.model, max_per_function=a.max_per_function)
         print(json.dumps(r, indent=2))
         return 0 if r["mismatched"] == 0 else 1
-    stats = build(a.episodes, a.tasks, a.out, a.model)
+    stats = build(a.episodes, a.tasks, a.out, a.model, max_per_function=a.max_per_function)
     print(json.dumps(stats, indent=2, ensure_ascii=False))
     if stats["inconsistent_fraction"] and stats["inconsistent_fraction"] > MAX_INCONSISTENT:
         print(f"[sft-data] STOP: {stats['inconsistent_fraction']:.2%} of trajectories are inconsistent (> 2%)")

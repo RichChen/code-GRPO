@@ -7,8 +7,9 @@ cross entropy over all assistant tokens of its micro-batches. Logs go to ``<out_
 records every ``log_every`` steps, val records at step 0, every ``eval_every`` steps and after each epoch.
 
 Every step is checked. Any stop condition of the plan (non-finite loss, loss scale below ``min_scale`` or
-dropping for ``max_consecutive_skipped_steps`` steps in a row, OOM, estimated time over ``max_hours``, val
-loss after epoch 1 not below the initial one) writes a ``stop`` record and exits with status 4; nothing is
+dropping for ``max_consecutive_skipped_steps`` steps in a row, more than ``max_skipped_fraction`` of all
+optimizer steps skipped by the GradScaler, OOM, estimated time over ``max_hours``, val loss after epoch 1 not
+below the initial one) writes a ``stop`` record and exits with status 4; nothing is
 changed and retried. After training the adapter is merged into the base and saved as fp16 in
 ``<out_dir>/merged`` together with the base model's own tokenizer files.
 """
@@ -163,7 +164,7 @@ def train(cfg: dict[str, Any], model: Any = None, device: str = "cuda",
     model = apply_lora(model, cfg)
     params = [p for p in model.parameters() if p.requires_grad]
     summary["trainable_params"] = sum(p.numel() for p in params)
-    opt = torch.optim.AdamW(params, lr=cfg["lr"], weight_decay=cfg["weight_decay"])
+    opt = torch.optim.AdamW(params, lr=cfg["lr"], betas=tuple(cfg["adam_betas"]), weight_decay=cfg["weight_decay"])
     scaler = torch.amp.GradScaler(device, enabled=cfg["grad_scaler"] and device == "cuda")
     model.train()
 
@@ -212,6 +213,9 @@ def train(cfg: dict[str, Any], model: Any = None, device: str = "cuda",
                     raise Stop(f"loss scale fell to {scale} at step {step}")
                 if consecutive_skips >= stop_cfg["max_consecutive_skipped_steps"]:
                     raise Stop(f"loss scale dropped on {consecutive_skips} consecutive steps (now {scale}) at step {step}")
+                if skipped_total > stop_cfg["max_skipped_fraction"] * total_steps:
+                    raise Stop(f"{skipped_total} skipped steps exceed {stop_cfg['max_skipped_fraction']:.0%} of "
+                               f"{total_steps} total steps at step {step}")
                 window["loss"] += step_loss
                 window["tokens"] += n_tokens
                 window["seq_tokens"] += seq_tokens
@@ -230,7 +234,7 @@ def train(cfg: dict[str, Any], model: Any = None, device: str = "cuda",
                     rec = {"type": "train", "step": step, "epoch": epoch + 1, "loss": round(window["loss"] / window["tokens"], 5),
                            "lr": lr, "grad_norm": round(gnorm, 4) if math.isfinite(gnorm) else str(gnorm),
                            "grad_norm_max": round(window["gnorm_max"], 4), "scale": scale,
-                           "skipped_steps": int(window["skipped"]),
+                           "skipped_steps": int(window["skipped"]), "skipped_total": skipped_total,
                            "tokens_per_s": round(train_seq_tokens / train_time, 1)}
                     if device == "cuda":
                         rec["peak_mem_gib"] = gib(torch.cuda.max_memory_allocated())
@@ -252,7 +256,8 @@ def train(cfg: dict[str, Any], model: Any = None, device: str = "cuda",
     except Stop as exc:
         summary["stop"] = str(exc)
     summary.update({
-        "steps_done": step, "skipped_steps": skipped_total, "final_scale": scaler.get_scale() if scaler.is_enabled() else None,
+        "steps_done": step, "skipped_steps": skipped_total,
+        "skipped_fraction": round(skipped_total / total_steps, 4), "final_scale": scaler.get_scale() if scaler.is_enabled() else None,
         "val_losses": [[s, round(v, 5)] for s, v in vals], "train_hours": round(train_time / 3600, 3),
         "wall_hours": round((time.time() - t0) / 3600, 3),
         "grad_norm_median": round(sorted(gnorms)[len(gnorms) // 2], 4) if gnorms else None,

@@ -31,12 +31,12 @@ def tasks_for(spec):
     return {tid: SimpleNamespace(meta={"bug_source": fn, "bug_type": bt}) for tid, (fn, bt) in spec.items()}
 
 
-def test_select_one_per_task_and_three_per_function_preferring_new_bug_types():
+def test_select_one_per_task_capped_per_function_preferring_new_bug_types():
     spec = {f"t{i}": ("mbpp/1", "arith_swap" if i < 3 else f"type{i}") for i in range(6)}
     spec["u0"] = ("mbpp/2", "var_swap")
     tasks = tasks_for(spec)
     records = [rec(t) for t in spec] + [rec("t0", k=1), rec("u0", k=1, reward=0)]
-    kept, discards = select(records, tasks, seed=0)
+    kept, discards = select(records, tasks, seed=0, max_per_function=3)
     by_fn = {}
     for r in kept:
         by_fn.setdefault(tasks[r["task_id"]].meta["bug_source"], []).append(r)
@@ -46,7 +46,12 @@ def test_select_one_per_task_and_three_per_function_preferring_new_bug_types():
     assert types.count("arith_swap") <= 1  # four distinct types available, so no repeats
     assert next(r for r in kept if r["task_id"] == "u0")["k"] == 0
     assert discards == {"duplicate_task": 1, "function_cap": 3, "not_solved": 1}
-    assert select(records, tasks, seed=0)[0] == kept
+    assert select(records, tasks, seed=0, max_per_function=3)[0] == kept
+
+    kept5, discards5 = select(records, tasks, seed=0)  # default cap is 5 (audit revision 2A-1)
+    assert sum(1 for r in kept5 if tasks[r["task_id"]].meta["bug_source"] == "mbpp/1") == 5
+    assert discards5["function_cap"] == 1
+    assert len({tasks[r["task_id"]].meta["bug_type"] for r in kept5}) == 5  # all four mbpp/1 types plus var_swap
 
 
 def test_split_val_takes_whole_functions():

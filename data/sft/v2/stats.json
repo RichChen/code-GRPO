@@ -1,0 +1,135 @@
+{
+  "model": "Qwen/Qwen3-1.7B",
+  "episodes_file": "runs/deepseek-sft/episodes.jsonl",
+  "episodes": 1443,
+  "selected_before_rendering": 880,
+  "max_per_function": 5,
+  "kept_per_function": {
+    "1": 43,
+    "2": 48,
+    "3": 30,
+    "4": 24,
+    "5": 111
+  },
+  "discards": {
+    "not_solved": 272,
+    "format_error": 1,
+    "nudged": 11,
+    "truncated": 0,
+    "too_many_turns": 37,
+    "changed_outside_pkg": 0,
+    "duplicate_task": 0,
+    "function_cap": 242,
+    "inconsistent": 0
+  },
+  "inconsistent_by_check": {},
+  "inconsistent_fraction": 0.0,
+  "val_functions": 13,
+  "all": {
+    "trajectories": 880,
+    "samples": 4410,
+    "bug_source_functions": 256,
+    "sample_tokens": {
+      "median": 1505.0,
+      "p95": 2318,
+      "max": 4537,
+      "mean": 1529.4
+    },
+    "trajectory_tokens_final_turn": {
+      "median": 1737.5,
+      "p95": 2587,
+      "max": 4537,
+      "mean": 1835.5
+    },
+    "turns_per_trajectory": {
+      "4": 246,
+      "5": 512,
+      "6": 24,
+      "7": 62,
+      "8": 36
+    },
+    "tokens_total": 6744771,
+    "assistant_tokens": 227427,
+    "assistant_token_fraction": 0.0337,
+    "over_8192_tokens": 0,
+    "bug_types": {
+      "arith_swap": 178,
+      "bool_swap": 27,
+      "compare_swap": 101,
+      "const_off_by_one": 237,
+      "remove_branch": 138,
+      "var_swap": 199
+    }
+  },
+  "train": {
+    "trajectories": 827,
+    "samples": 4145,
+    "bug_source_functions": 243,
+    "sample_tokens": {
+      "median": 1504,
+      "p95": 2325,
+      "max": 4537,
+      "mean": 1530.1
+    },
+    "trajectory_tokens_final_turn": {
+      "median": 1734,
+      "p95": 2587,
+      "max": 4537,
+      "mean": 1836.2
+    },
+    "turns_per_trajectory": {
+      "4": 237,
+      "5": 473,
+      "6": 23,
+      "7": 58,
+      "8": 36
+    },
+    "tokens_total": 6342078,
+    "assistant_tokens": 212781,
+    "assistant_token_fraction": 0.0336,
+    "over_8192_tokens": 0,
+    "bug_types": {
+      "arith_swap": 166,
+      "bool_swap": 26,
+      "compare_swap": 98,
+      "const_off_by_one": 220,
+      "remove_branch": 133,
+      "var_swap": 184
+    }
+  },
+  "val": {
+    "trajectories": 53,
+    "samples": 265,
+    "bug_source_functions": 13,
+    "sample_tokens": {
+      "median": 1517,
+      "p95": 2064,
+      "max": 3373,
+      "mean": 1519.6
+    },
+    "trajectory_tokens_final_turn": {
+      "median": 1773,
+      "p95": 2556,
+      "max": 3373,
+      "mean": 1825.2
+    },
+    "turns_per_trajectory": {
+      "4": 9,
+      "5": 39,
+      "6": 1,
+      "7": 4
+    },
+    "tokens_total": 402693,
+    "assistant_tokens": 14646,
+    "assistant_token_fraction": 0.0364,
+    "over_8192_tokens": 0,
+    "bug_types": {
+      "arith_swap": 12,
+      "bool_swap": 1,
+      "compare_swap": 3,
+      "const_off_by_one": 17,
+      "remove_branch": 5,
+      "var_swap": 15
+    }
+  }
+}

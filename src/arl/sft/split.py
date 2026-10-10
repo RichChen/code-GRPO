@@ -2,12 +2,14 @@
 
     uv run python -m arl.sft.split        # SFT / RL pools
     uv run python -m arl.sft.split dev    # dev set: 100 RL-pool tasks, one per bug source function
+    uv run python -m arl.sft.split rl-train   # GRPO training ids: RL pool minus the dev set
 
 Clusters are the ones the task build uses (``arl.taskgen.dedup.clusters`` over every source function).
 Training-side clusters are shuffled with ``sftsplit-{seed}`` and added to the SFT pool until it holds at
 least ``SFT_FRACTION`` of the training set's bug source functions; the rest go to the RL pool. A task
 belongs to the pool of its bug source function. The task jsonl files are not touched: the split is two id
-lists plus ``phase2-split.json`` with their sha256.
+lists plus ``phase2-split.json`` with their sha256. The dev set is for model selection and diagnosis only;
+GRPO trains on ``rl_train_ids.txt`` (RL pool minus dev), which is recorded in the same manifest.
 """
 
 from __future__ import annotations
@@ -104,6 +106,8 @@ def make_split(tasks_dir: Path = TASKS, raw_dir: Path = RAW, seed: int = 0) -> d
         "files": files,
     }
     (tasks_dir / "phase2-split.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    if (tasks_dir / "dev_ids.txt").exists():
+        manifest = make_rl_train(tasks_dir)
     return manifest
 
 
@@ -132,18 +136,46 @@ def make_dev(tasks_dir: Path = TASKS, seed: int = 0) -> dict[str, Any]:
     path = tasks_dir / "dev_ids.txt"
     path.write_text("".join(f"{i}\n" for i in ids), encoding="utf-8")
     by_id = {t.task_id: t for t in tasks}
-    return {"seed": f"dev-{seed}", "tasks": len(ids), "sha256": sha256_file(path),
-            **{k: v for k, v in pool_stats([by_id[i] for i in ids]).items() if k != "max_kept_at_3_per_function"}}
+    result = {"seed": f"dev-{seed}", "tasks": len(ids), "sha256": sha256_file(path),
+              **{k: v for k, v in pool_stats([by_id[i] for i in ids]).items() if k != "max_kept_at_3_per_function"}}
+    make_rl_train(tasks_dir)
+    return result
+
+
+def make_rl_train(tasks_dir: Path = TASKS) -> dict[str, Any]:
+    """Write ``rl_train_ids.txt`` (RL pool minus dev) and record it, with the dev set, in ``phase2-split.json``."""
+    rl = set(read_ids(tasks_dir / "train_rl_ids.txt"))
+    dev = set(read_ids(tasks_dir / "dev_ids.txt"))
+    assert dev <= rl, "dev set must come from the RL pool"
+    ids = sorted(rl - dev)
+    path = tasks_dir / "rl_train_ids.txt"
+    path.write_text("".join(f"{i}\n" for i in ids), encoding="utf-8")
+    fn_of = {t.task_id: t.meta["bug_source"] for t in load_tasks(tasks_dir / "train.jsonl")}
+    manifest_path = tasks_dir / "phase2-split.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["dev_ids"] = {"tasks": len(dev), "bug_source_functions": len({fn_of[i] for i in dev}),
+                           "sha256": sha256_file(tasks_dir / "dev_ids.txt")}
+    manifest["rl_train_ids"] = {"definition": "train_rl_ids minus dev_ids", "tasks": len(ids),
+                                "bug_source_functions": len({fn_of[i] for i in ids}), "sha256": sha256_file(path)}
+    manifest["files"] = manifest["files"] | {"dev_ids.txt": manifest["dev_ids"]["sha256"],
+                                             path.name: manifest["rl_train_ids"]["sha256"]}
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return manifest
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", nargs="?", choices=["pools", "dev"], default="pools")
+    ap.add_argument("command", nargs="?", choices=["pools", "dev", "rl-train"], default="pools")
     ap.add_argument("--tasks", type=Path, default=TASKS)
     ap.add_argument("--raw", type=Path, default=RAW)
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args(argv)
-    result = make_dev(a.tasks, a.seed) if a.command == "dev" else make_split(a.tasks, a.raw, a.seed)
+    if a.command == "dev":
+        result = make_dev(a.tasks, a.seed)
+    elif a.command == "rl-train":
+        result = {k: v for k, v in make_rl_train(a.tasks).items() if k in ("dev_ids", "rl_train_ids")}
+    else:
+        result = make_split(a.tasks, a.raw, a.seed)
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
 

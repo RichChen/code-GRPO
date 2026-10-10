@@ -567,3 +567,46 @@
 `docs/plan/CHECKPOINT-2A.md` 已写好：第 0–3 步的结论、花费明细（9.845 元）、数据集统计、一致性测试结果、3 个样本，以及需要审计方决定的事（样本门槛和每函数上限的冲突、按轮切样本、fp16 下 inf 的判定口径）。Qwen3-1.7B 权重保留，GPU 空闲。
 
 测试结果：`uv run pytest -q` → 229 passed，2 skipped。
+
+# Phase 2A 第二轮（审计修订 2A-1）
+
+CHECKPOINT-2A-1 审计通过。本轮按修订 2A-1 重建数据集，再做第 4–6 步。
+
+## 修订 2A-1 补进计划
+
+修订原文补在 `PHASE-2-SFT.zh-CN.md` 第 3 步末尾，和本轮 prompt 一起单独提交。
+
+## 重建 SFT 数据集 v2（每个函数最多 5 条）
+
+- `arl.sft.data` 的每函数上限改为参数 `--max-per-function`，默认 5，输出默认 `data/sft/v2/`。同一函数内部的选择规则没变。v1 不动；用 `--max-per-function 3` 重建到临时目录，`train.jsonl`、`val.jsonl` 和 v1 逐字节相同。
+- 没有重新采集，用的还是 `runs/deepseek-sft/episodes.jsonl`。
+- **筛选结果**：880 条轨迹（门槛 800），来自 256 个函数。弃用原因：没解出 272，格式错误 1，被提醒过 11，超过 8 轮 37，超过每函数上限 242，模板不一致 0。
+- **每个函数保留几条**：1 条的 43 个函数，2 条的 48 个，3 条的 30 个，4 条的 24 个，5 条的 111 个。
+- **一致性检查**全部重跑：
+  - 文本、token 和 hermes 解析三项检查，0 条不一致；
+  - vLLM 服务端 `/tokenize` 比对 4410 个前缀，0 处不一致（`runs/sft-data/v2/crosscheck.json`）；
+  - 反向对照：抽 20 个已存样本，直接和服务端结果比。请求正确时 20/20 一致；去掉 `enable_thinking=False` 或去掉 tools 后都是 0/20（`runs/sft-data/v2/negative-controls.txt`）。
+- **抽 3 个样本**（`show --n 3 --seed 0`，`runs/sft-data/v2/show.md`）：loss 都从 `<think>\n\n</think>\n\n` 之后开始，到 `<|im_end|>` 结束，历史轮没有 think 块。
+- **数据集统计**（`data/sft/v2/stats.json`）：
+
+  | | train | val |
+  | --- | --- | --- |
+  | 轨迹 | 827 | 53 |
+  | 按轮样本 | 4145 | 265 |
+  | 来源函数 | 243 | 13 |
+  | 样本长度 中位数 / p95 / 最大（token） | 1504 / 2325 / 4537 | 1517 / 2064 / 3373 |
+  | 整条轨迹最后一轮的长度 中位数 / p95 / 最大 | 1734 / 2587 / 4537 | 1773 / 2556 / 3373 |
+  | 总 token / assistant token | 6,342,078 / 212,781 | 402,693 / 14,646 |
+  | assistant token 占比 | 3.4% | 3.6% |
+  | 超过 8192 的样本 | 0 | 0 |
+  | 轮数 4/5/6/7/8 | 237/473/23/58/36 | 9/39/1/4/0 |
+  | arith / bool / compare / const / remove_branch / var | 166/26/98/220/133/184 | 12/1/3/17/5/15 |
+
+  每个 epoch 的训练 token 量约 634 万，2 个 epoch 约 1268 万。按最后一轮长度合计，train 只有 152 万，按轮切样本放大了约 4.2 倍。
+- **`rl_train_ids`**（`uv run python -m arl.sft.split rl-train`）：RL 池减去 dev 集，共 1853 题，来自 377 个函数，sha256 `65524993…1d9a`。写在 `data/tasks/rl_train_ids.txt`，`phase2-split.json` 里同时记了 `dev_ids` 和 `rl_train_ids` 两项。
+  - RL 池原来有 387 个函数，其中 10 个函数只有 1 题，而且都被抽进了 dev 集，所以剩 377 个函数。
+  - 重跑 `pools` 和 `dev`，清单和三个 id 文件的 sha256 都不变。
+  - 新测试检查：`rl_train_ids` 和 dev 集不相交，等于 RL 池减 dev 集，清单里的题数、函数数和 sha256 都对得上。
+- **训练配置**（为第 4 步准备）：数据改为 v2；写明 `adam_betas [0.9, 0.999]`；新增停止条件 `max_skipped_fraction 0.05`，即 GradScaler 跳过的步数超过总步数的 5% 就停止。训练日志新增累计跳过步数，summary 新增跳过比例。新增 GPU 测试：把初始 scale 设成 2^60 强制溢出，第 2 个被跳过的步就会停下。
+
+测试结果：`uv run pytest -q` → 230 passed，2 skipped；`~/.venvs/vllm` 全量 → 234 passed，1 skipped；`~/.venvs/train` 里跑 `tests/train/` → 9 passed，1 skipped（训练环境没有 `openai`，其余测试不在这里跑）。

@@ -74,6 +74,19 @@
   "rl_tasks_with_an_sft_function_as_distractor": 1920,
   "files": {
     "train_sft_ids.txt": "451668fc18f4c8bc62de302761d1d469d07e7e1cffb44e3078e513cfc469a9f1",
-    "train_rl_ids.txt": "05933ff7e76268215077b334ea3654ea719f6f36a787b0cfe041364bb80cfbbf"
+    "train_rl_ids.txt": "05933ff7e76268215077b334ea3654ea719f6f36a787b0cfe041364bb80cfbbf",
+    "dev_ids.txt": "c0735d2d684e687eeb3be03ad255ee37605ddb4109c07706b79c717412e8251a",
+    "rl_train_ids.txt": "65524993865073ccf4426132ed99abc2f2dcf39e4064d981a304127654c21d9a"
+  },
+  "dev_ids": {
+    "tasks": 100,
+    "bug_source_functions": 100,
+    "sha256": "c0735d2d684e687eeb3be03ad255ee37605ddb4109c07706b79c717412e8251a"
+  },
+  "rl_train_ids": {
+    "definition": "train_rl_ids minus dev_ids",
+    "tasks": 1853,
+    "bug_source_functions": 377,
+    "sha256": "65524993865073ccf4426132ed99abc2f2dcf39e4064d981a304127654c21d9a"
   }
 }

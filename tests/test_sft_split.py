@@ -73,3 +73,23 @@ def test_real_split_is_a_partition_of_train_by_cluster():
         assert len(dev) == len(set(dev)) == 100
         assert set(dev) <= rl
         assert len({train[i].meta["bug_source"] for i in dev}) == 100
+
+
+def test_rl_train_ids_are_rl_pool_minus_dev():
+    import json
+
+    from arl.env.task import load_tasks
+    from arl.taskgen.sources import sha256_file
+
+    rl = set(read_ids(TASKS / "train_rl_ids.txt"))
+    dev = set(read_ids(TASKS / "dev_ids.txt"))
+    rl_train_list = read_ids(TASKS / "rl_train_ids.txt")
+    rl_train = set(rl_train_list)
+    assert len(rl_train) == len(rl_train_list)
+    assert not rl_train & dev
+    assert rl_train == rl - dev
+    fn_of = {t.task_id: t.meta["bug_source"] for t in load_tasks(TASKS / "train.jsonl")}
+    entry = json.loads((TASKS / "phase2-split.json").read_text())["rl_train_ids"]
+    assert entry["tasks"] == len(rl_train)
+    assert entry["bug_source_functions"] == len({fn_of[i] for i in rl_train})
+    assert entry["sha256"] == sha256_file(TASKS / "rl_train_ids.txt")

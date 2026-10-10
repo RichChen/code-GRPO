@@ -40,10 +40,11 @@ def config(tmp_path, **kw):
     cfg = {"lora": {"r": 4, "alpha": 8, "dropout": 0.0, "target_modules": ["q_proj", "v_proj", "up_proj", "down_proj"]},
            "weights_dtype": "float32", "adapter_dtype": "float32", "autocast_dtype": "float16", "grad_scaler": True,
            "gradient_checkpointing": True, "max_seq_len": 32, "micro_batch_size": 1, "grad_accum": 4, "lr": 3e-2,
-           "warmup_ratio": 0.03, "weight_decay": 0.0, "max_grad_norm": 1.0, "epochs": 2, "seed": 0, "log_every": 2,
+           "warmup_ratio": 0.03, "adam_betas": [0.9, 0.999], "weight_decay": 0.0, "max_grad_norm": 1.0, "epochs": 2, "seed": 0, "log_every": 2,
            "eval_every": 5, "train_data": str(tmp_path / "train.jsonl"), "val_data": str(tmp_path / "val.jsonl"),
            "out_dir": str(tmp_path / "out"),
-           "stop": {"max_hours": 12, "min_scale": 1.0, "max_consecutive_skipped_steps": 10, "estimate_after_steps": 3}}
+           "stop": {"max_hours": 12, "min_scale": 1.0, "max_consecutive_skipped_steps": 10,
+                    "max_skipped_fraction": 0.05, "estimate_after_steps": 3}}
     cfg.update(kw)
     return cfg
 
@@ -123,3 +124,14 @@ def test_fp16_weights_with_autocast_and_grad_scaler_on_gpu(tmp_path):
     assert "peak_mem_gib" in train_recs[0]
     vals = [r["val_loss"] for r in log if r["type"] == "val"]
     assert vals[-1] < vals[0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_too_many_skipped_steps_stops(tmp_path, monkeypatch):
+    real = torch.amp.GradScaler
+    monkeypatch.setattr(torch.amp, "GradScaler", lambda *a, **kw: real(*a, init_scale=2.0 ** 60, **kw))
+    summary, log = run(config(tmp_path), torch.float16, "cuda")
+    # 32 total steps: the second skipped step is above 5%
+    assert summary["stop"].startswith("2 skipped steps exceed 5% of 32"), summary.get("stop")
+    assert summary["skipped_steps"] == 2 and summary["steps_done"] == 2
+    assert log[-1]["type"] == "stop"

@@ -18,19 +18,21 @@
   "lr": 1e-4,
   "schedule": "cosine",
   "warmup_ratio": 0.03,
+  "adam_betas": [0.9, 0.999],
   "weight_decay": 0.0,
   "max_grad_norm": 1.0,
   "epochs": 2,
   "seed": 0,
   "log_every": 10,
   "eval_every": 100,
-  "train_data": "data/sft/v1/train.jsonl",
-  "val_data": "data/sft/v1/val.jsonl",
+  "train_data": "data/sft/v2/train.jsonl",
+  "val_data": "data/sft/v2/val.jsonl",
   "out_dir": "runs/sft-preview",
   "stop": {
     "max_hours": 12,
     "min_scale": 1.0,
     "max_consecutive_skipped_steps": 10,
+    "max_skipped_fraction": 0.05,
     "estimate_after_steps": 20
   }
 }
