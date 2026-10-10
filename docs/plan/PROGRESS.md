@@ -322,3 +322,86 @@
 - README 补上"接入一个新的 policy""启动推理服务""付费 API"三节。
 
 测试结果：`uv run pytest -q` → 210 passed。新增的测试：提醒后继续并修好；第二次没有工具调用时视为提交；提醒计入轮数；编辑成功后不提醒；编辑失败不算编辑过；`nudged` 字段的序列化和旧记录兼容；JSON 说明不超过 60 词；`.env` 解析和环境变量优先；`extra_body` 和缓存命中计价；不带工具的请求；脱敏；花费上限和续跑；诊断指标。
+
+## 审计修订 4 · 第 2 步：本地模型诊断扫描
+
+做了什么：
+- 题目是试点那 100 道（seed 0），每题 4 次，temperature 0.8，环境 `phase1-env-v1`。每个模型跑一遍 `scripts/diag_model.sh <model> <name> configs/diag/<name>.json`，步骤如下：
+  - 起 vLLM 服务；
+  - 记录启动耗时、显存、KV cache 大小和 HF 版本，写入 `runs/diag/<name>-serve.json`；
+  - 跑 `calibrate pilot`；
+  - 关掉服务；
+  - 只在跑完以后删除权重。
+- vLLM 命令，所有模型都一样：
+  ```
+  HF_HUB_OFFLINE=1 ~/.venvs/vllm/bin/vllm serve <model> --dtype half --max-model-len 8192 --enable-auto-tool-choice --tool-call-parser hermes --host 127.0.0.1 --port 8000 --gpu-memory-utilization 0.85 --seed 0
+  ```
+- 下载前用 HF API 确认 5 个模型 ID 都存在。
+- parser 全部用 `hermes`：
+  - vLLM 文档"Qwen Models"一节写的是 `Qwen/Qwen2.5-*` 用 `--tool-call-parser hermes`；
+  - Qwen 官方文档 function_call 一节写的是，Qwen3 的模板内置 Hermes 风格，vLLM 用 `--tool-call-parser hermes`；只有 Qwen3-Coder 用 `qwen3_xml`。
+  - 脚本会检查每个模型的聊天模板里是否有 `<tool_call>`，五个都有。
+- Qwen3-1.7B 通过 `extra_body.chat_template_kwargs.enable_thinking=false` 关闭思考模式。
+- 下载用 `scripts/fetch_models.sh`：
+  - 经代理，设置 `HF_HUB_DISABLE_XET=1`；
+  - 3 分钟没有写入就重启，最多 10 次。
+- 结果：
+
+  | 模型 | 解出率 | 格式错误率 | 平均轮数 | 吞吐量 |
+  | --- | --- | --- | --- | --- |
+  | Qwen2.5-1.5B | 0% | 37.6% | 3.24 | 3332/小时 |
+  | Qwen2.5-Coder-1.5B | 0% | 100% | 4.58 | — |
+  | Qwen2.5-3B | 7.2% | 11.4% | 8.62 | 829/小时 |
+  | Qwen3-1.7B | 17.7% | 2.1% | 5.37 | 2126/小时 |
+  | Qwen3-4B-Instruct-2507 | 显存不够，跳过 | — | — | — |
+
+  - Qwen2.5-Coder-1.5B 的工具调用全部写成 ```json 代码块，从来不用 `<tool_call>`。
+  - Qwen3-4B-Instruct-2507：权重 7.64 GiB，KV cache 只剩 0.33 GiB，8k 上下文需要 1.12 GiB。没有改量化方式或显存设置。
+  - 完整指标见 CHECKPOINT-1D。
+
+遇到的问题：
+- `--gpu-memory-utilization 0.90` 起不来：空闲 9.87 GiB，小于 9.9 GiB。改用 0.85。旧版脚本失败后也删了权重，已改为只在成功后删除。
+- `hf` 把大文件放在共享的 `hub/blobs/`，只删模型目录不会释放空间。脚本改为顺着链接删除实际文件。
+- xet 下载经代理时多次卡住，改走普通 HTTP，三个模型并行，共约 78 分钟。
+- 现在模型缓存已清空，`~/.cache/huggingface` 只剩 2 MB。
+
+## 审计修订 4 · 第 3 步：DeepSeek 参考上限
+
+- 先跑 `calibrate preflight --config configs/deepseek.json --budget-cny 10 --cost-file runs/deepseek/cost.json`：返回 `ok`，花费 0.000024 元。
+- 再跑 `calibrate pilot --config configs/deepseek.json --k 2 --runs runs/deepseek --name deepseek --budget-cny 10`：
+  - 直连，`trust_env=false`，`thinking` 关闭，`max_tokens` 1024；
+  - 累计花费写在 `runs/deepseek/cost.json`。
+- 结果：
+  - 200 个 episode，没有报错，解出率 89.5%；
+  - 解出的 episode 轮数中位数 5、p90 是 6；
+  - 格式错误率 0.1%；
+  - 总花费 1.2783 元，平均每个 episode 0.0064 元；
+  - 估算 1000 条成功轨迹约 7.6 元。
+- 密钥检查：`runs/`、`docs/`、`src/`、`configs/`、`scripts/`、`tests/` 里没有密钥，也没有 `Authorization`。
+
+## 审计修订 4 · 第 4 步：判分假阴性
+
+- 新增 `src/arl/rollout/falseneg.py`。命令是 `uv run python -m arl.rollout.falseneg runs/diag/*.jsonl runs/deepseek/deepseek.jsonl --out runs/falseneg`，做三件事：
+  - 找出没拿到奖励、隐藏 test 和 challenge 用例全过、只有 generated 用例失败的 episode；
+  - 按 seed 每个模型抽 5 个；
+  - 重放 `edit_file` 调用，复原模型的 diff，在沙箱里重跑失败的用例，得到实际返回值。
+- 额外条件"改过 `pkg/` 下的文件"：因为可见测试用到的那条用例不在隐藏用例里，有 713 道题的 bug 版只挂在生成用例上；模型什么都不改，也满足字面条件。
+- 结果（字面条件 / 改过 `pkg/`）：
+
+  | 模型 | 只有生成用例失败 | 其中改过 `pkg/` |
+  | --- | --- | --- |
+  | Qwen2.5-1.5B | 64 | 0 |
+  | Qwen2.5-Coder-1.5B | 64 | 0 |
+  | Qwen2.5-3B | 59 | 6 |
+  | Qwen3-1.7B | 25 | 12 |
+  | DeepSeek | 5 | 5 |
+
+- 人工判断：
+  - 小模型的 10 个样例都是模型确实没修对。
+  - DeepSeek 有 3 个是假阴性（mbpp/236 两个、mbpp/511 一个），原因是 MBPP 原始代码在合法输入上本身就错；另外 2 个（mbpp/850）是模型修错。
+
+测试结果：`uv run pytest -q` → 211 passed（新增 `test_generated_only_failures`）。
+
+## CHECKPOINT-1D
+
+写好了 `docs/plan/CHECKPOINT-1D.md`。没有写训练代码，没有跑全量校准，没有开始阶段 2。

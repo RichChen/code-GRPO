@@ -245,3 +245,18 @@ def test_behaviour_metrics_in_records_and_summary(tmp_path):
     assert d["first_turn_no_tool_call"] == 0.667 and d["edit_success_rate"] == 1.0
     assert d["episodes_with_successful_edit"] == 0.667 and d["episodes_visible_pass_any"] == 0.667
     assert d["solved_turns_median"] == 3 and d["solved_turns_p90"] == 4
+
+
+def test_generated_only_failures():
+    from arl.rollout.falseneg import generated_only_failures
+
+    task = SimpleNamespace(meta={"hidden_case_kinds": ["test", "challenge", "generated", "generated"]})
+
+    def rec(passed, reward=0, **grade):
+        return {"reward": reward, "grade": {"case_passed": passed, "timed_out": False, "setup_error": None, **grade}}
+
+    assert generated_only_failures(rec([True, True, False, True]), task) == [2]
+    assert generated_only_failures(rec([False, True, False, True]), task) is None   # a test case fails too
+    assert generated_only_failures(rec([True, False, True, True]), task) is None    # a challenge case fails
+    assert generated_only_failures(rec([True] * 4, reward=1), task) is None
+    assert generated_only_failures(rec([True, True, False, False], timed_out=True), task) is None
