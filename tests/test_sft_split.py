@@ -26,6 +26,17 @@ def test_split_tasks_follows_the_bug_source():
     assert ids == {"sft": ["t0", "t1"], "rl": ["t2", "t3"]}
 
 
+def test_dev_sample_takes_one_task_per_function_first():
+    from arl.sft.split import dev_sample
+
+    tasks = [SimpleNamespace(task_id=f"t{i}", meta={"bug_source": f"f{i % 7}"}) for i in range(30)]
+    ids = dev_sample(tasks, n=5, seed=0)
+    fns = {f"f{int(i[1:]) % 7}" for i in ids}
+    assert len(ids) == 5 and len(fns) == 5 and ids == sorted(ids)
+    assert dev_sample(tasks, n=5, seed=0) == ids
+    assert len(set(dev_sample(tasks, n=10, seed=0))) == 10
+
+
 needs_tasks = pytest.mark.skipif(not (TASKS / "train_sft_ids.txt").exists() or not (TASKS / "train.jsonl").exists(),
                                  reason="task set or split files not present")
 
@@ -55,3 +66,10 @@ def test_real_split_is_a_partition_of_train_by_cluster():
     manifest = json.loads((TASKS / "phase2-split.json").read_text())
     for p in POOLS:
         assert manifest["files"][f"train_{p}_ids.txt"] == sha256_file(TASKS / f"train_{p}_ids.txt")
+
+    dev_path = TASKS / "dev_ids.txt"
+    if dev_path.exists():
+        dev = read_ids(dev_path)
+        assert len(dev) == len(set(dev)) == 100
+        assert set(dev) <= rl
+        assert len({train[i].meta["bug_source"] for i in dev}) == 100

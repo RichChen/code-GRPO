@@ -554,3 +554,16 @@
 - **停止**：筛选后 634 条，少于 800 条，按计划停下报告。这在第 1 步就能确定（SFT 池的理论上限是 668 条），用户确认后照计划采完并构建了数据集。第 4–6 步没有执行，详见 `docs/plan/CHECKPOINT-2A.md`。
 
 测试结果：`uv run pytest -q` → 229 passed，2 skipped；`~/.venvs/vllm` 里跑 `tests/train/test_sft_render.py` 和 `tests/test_sft_data.py` → 9 passed。
+
+## 第 4、5 步：只准备了代码，没有执行
+
+触发停止条件后没有训练，也没有评测。采集期间写好并测过的代码和本报告一起提交：
+- `src/arl/sft/train.py`、`configs/sft/preview.json`、`requirements-train.txt`（`~/.venvs/train`：torch 2.13.0、transformers 5.17.0、peft 0.21.2）、`tests/train/test_sft_train.py`（在训练环境里 8 passed，包括 GPU 上 fp16 加 GradScaler 的小模型训练）。
+- `data/tasks/dev_ids.txt`（`uv run python -m arl.sft.split dev`，RL 池 100 题，来自 100 个不同函数，seed `dev-0`），没有在上面跑过任何东西。
+- `scripts/eval_dev.sh`（启动参数和诊断扫描相同，不删权重），`calibrate --ids`，`src/arl/sft/evaluate.py`（两种口径、配对 bootstrap），`tests/test_sft_evaluate.py`。
+
+## CHECKPOINT-2A（提前停下）
+
+`docs/plan/CHECKPOINT-2A.md` 已写好：第 0–3 步的结论、花费明细（9.845 元）、数据集统计、一致性测试结果、3 个样本，以及需要审计方决定的事（样本门槛和每函数上限的冲突、按轮切样本、fp16 下 inf 的判定口径）。Qwen3-1.7B 权重保留，GPU 空闲。
+
+测试结果：`uv run pytest -q` → 229 passed，2 skipped。

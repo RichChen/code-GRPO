@@ -1,6 +1,7 @@
 """Split the training tasks into an SFT pool and an RL pool, whole near-duplicate clusters at a time.
 
-    uv run python -m arl.sft.split
+    uv run python -m arl.sft.split        # SFT / RL pools
+    uv run python -m arl.sft.split dev    # dev set: 100 RL-pool tasks, one per bug source function
 
 Clusters are the ones the task build uses (``arl.taskgen.dedup.clusters`` over every source function).
 Training-side clusters are shuffled with ``sftsplit-{seed}`` and added to the SFT pool until it holds at
@@ -23,6 +24,7 @@ from arl.taskgen.dedup import clusters
 from arl.taskgen.sources import load_sources, sha256_file
 
 SFT_FRACTION = 0.4
+DEV_SIZE = 100
 TASKS = Path("data/tasks")
 RAW = Path("data/raw")
 POOLS = ("sft", "rl")
@@ -105,13 +107,44 @@ def make_split(tasks_dir: Path = TASKS, raw_dir: Path = RAW, seed: int = 0) -> d
     return manifest
 
 
+def dev_sample(tasks: list[Task], n: int = DEV_SIZE, seed: int = 0) -> list[str]:
+    """Source-stratified sample: shuffled functions round-robin, one task per function per round (``dev-{seed}``)."""
+    by_fn: dict[str, list[Task]] = {}
+    for t in sorted(tasks, key=lambda t: t.task_id):
+        by_fn.setdefault(t.meta["bug_source"], []).append(t)
+    rng = random.Random(f"dev-{seed}")
+    order = sorted(by_fn)
+    rng.shuffle(order)
+    for fn in order:
+        rng.shuffle(by_fn[fn])
+    out: list[str] = []
+    while len(out) < n and any(by_fn.values()):
+        for fn in order:
+            if by_fn[fn] and len(out) < n:
+                out.append(by_fn[fn].pop().task_id)
+    return sorted(out)
+
+
+def make_dev(tasks_dir: Path = TASKS, seed: int = 0) -> dict[str, Any]:
+    rl = set(read_ids(tasks_dir / "train_rl_ids.txt"))
+    tasks = [t for t in load_tasks(tasks_dir / "train.jsonl") if t.task_id in rl]
+    ids = dev_sample(tasks, DEV_SIZE, seed)
+    path = tasks_dir / "dev_ids.txt"
+    path.write_text("".join(f"{i}\n" for i in ids), encoding="utf-8")
+    by_id = {t.task_id: t for t in tasks}
+    return {"seed": f"dev-{seed}", "tasks": len(ids), "sha256": sha256_file(path),
+            **{k: v for k, v in pool_stats([by_id[i] for i in ids]).items() if k != "max_kept_at_3_per_function"}}
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("command", nargs="?", choices=["pools", "dev"], default="pools")
     ap.add_argument("--tasks", type=Path, default=TASKS)
     ap.add_argument("--raw", type=Path, default=RAW)
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args(argv)
-    print(json.dumps(make_split(a.tasks, a.raw, a.seed), indent=2, ensure_ascii=False))
+    result = make_dev(a.tasks, a.seed) if a.command == "dev" else make_split(a.tasks, a.raw, a.seed)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
 
 
