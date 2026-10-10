@@ -80,8 +80,9 @@ def behaviour(result: EpisodeResult) -> dict[str, Any]:
 
 
 def episode_record(task: Task, k: int, result: EpisodeResult, policy: OpenAIPolicy, session: str,
-                   started: float) -> dict[str, Any]:
+                   started: float, with_messages: bool = False) -> dict[str, Any]:
     u = policy.usage
+    extra = {"messages": result.messages} if with_messages else {}
     return {
         "task_id": task.task_id,
         "k": k,
@@ -110,6 +111,7 @@ def episode_record(task: Task, k: int, result: EpisodeResult, policy: OpenAIPoli
         **behaviour(result),
         "grade": result.grade,
         "tool_calls": [c.__dict__ for c in result.tool_calls],
+        **extra,
     }
 
 
@@ -187,10 +189,11 @@ class CostLedger:
 def run_calibration(tasks: list[Task], out_path: Path, config: ClientConfig, k: int = K, concurrency: int = CONCURRENCY,
                     max_turns: int = MAX_TURNS, policy_factory: Callable[[Task, int], Any] | None = None,
                     max_consecutive_errors: int = 20, log: Callable[[str], None] = print,
-                    ledger: CostLedger | None = None) -> list[dict[str, Any]]:
+                    ledger: CostLedger | None = None, with_messages: bool = False) -> list[dict[str, Any]]:
     """Run every (task, k) episode not yet recorded in ``out_path``; return all records for these tasks.
 
     With a ``ledger``, no new episode starts once the budget would be reached (see ``CostLedger.exhausted``).
+    ``with_messages`` stores the full conversation in each record (SFT trajectories).
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     done = latest(load_records(out_path))
@@ -217,7 +220,7 @@ def run_calibration(tasks: list[Task], out_path: Path, config: ClientConfig, k: 
         try:
             policy = factory(task, i)
             result = run_episode(task, policy, max_turns=max_turns)
-            rec = episode_record(task, i, result, policy, session, started)
+            rec = episode_record(task, i, result, policy, session, started, with_messages)
         except Exception as exc:  # server errors etc.: record, retry on resume
             rec = {"task_id": task.task_id, "k": i, "session": session,
                    "error": redact(f"{type(exc).__name__}: {exc}", [config.api_key])[:500]}
@@ -475,6 +478,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", type=Path, default=TASKS / "calibrated")
     ap.add_argument("--split", choices=["train", "heldout"])
     ap.add_argument("--sample", type=int, default=None)
+    ap.add_argument("--ids", type=Path, default=None, help="only the task ids listed in this file (with --split)")
     ap.add_argument("--name", default=None)
     ap.add_argument("--k", type=int, default=K)
     ap.add_argument("--concurrency", type=int, default=CONCURRENCY)
@@ -496,6 +500,11 @@ def main(argv: list[str] | None = None) -> int:
         if not a.split:
             ap.error("--split is required")
         tasks = load_tasks(a.tasks / f"{a.split}.jsonl")
+        if a.ids:
+            wanted = {line.strip() for line in a.ids.read_text(encoding="utf-8").splitlines() if line.strip()}
+            tasks = [t for t in tasks if t.task_id in wanted]
+            if len(tasks) != len(wanted):
+                ap.error(f"{len(wanted) - len(tasks)} ids in {a.ids} are not in the {a.split} split")
         if a.sample and a.sample < len(tasks):
             tasks = stratified_sample(tasks, a.sample, a.seed)
         name = a.name or a.split
