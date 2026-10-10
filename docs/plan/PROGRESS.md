@@ -431,3 +431,30 @@
 测试结果：`uv run pytest -q` → 215 passed（新增 4 个：按类型记录且不改奖励、默认为空和旧记录兼容、超时算失败、regrade 能发现不一致）。
 
 提交后打 tag `phase2-grader-v1`。
+
+## 第 1 步：训练集再分成 SFT 池和 RL 池
+
+做了什么：
+- 新增 `src/arl/sft/split.py`（`uv run python -m arl.sft.split`）：
+  - 簇用 `arl.taskgen.dedup.clusters` 在全部 1070 个来源函数上重新算，和构建题集时一致（945 个簇，和 manifest 相同）；
+  - 只取含有训练集 bug 来源函数的簇，按首个成员排序后用 `sftsplit-0` 打乱，依次放进 SFT 池，直到 SFT 池的 bug 来源函数达到训练集的 40%（648 × 0.4 = 259.2），其余归 RL 池；
+  - 每道题跟着它的 bug 来源函数走。
+- 输出 `data/tasks/train_sft_ids.txt`、`train_rl_ids.txt`（每行一个题号，已排序），sha256 和统计写进 `data/tasks/phase2-split.json`。原来的 jsonl 没动。
+- 测试 `tests/test_sft_split.py`：簇不跨池、划分可复现；在真实文件上检查两个池不相交、并集是完整训练集、不含留出集的题、每个簇只落在一个池里、sha256 一致（没有题集文件时跳过）。
+
+结果：
+
+| | SFT 池 | RL 池 |
+| --- | --- | --- |
+| 题数 | 1279 | 1953 |
+| bug 来源函数 | 261（40.3%） | 387 |
+| 簇 | 240 | 340 |
+| arith_swap / bool_swap / compare_swap / const_off_by_one / remove_branch / var_swap | 255 / 48 / 156 / 335 / 204 / 281 | 367 / 69 / 269 / 487 / 310 / 451 |
+| 来源 mbpp / humaneval（按题） | 1046 / 233 | 1600 / 353 |
+| 每个函数最多保留 3 条时的理论上限 | **668** | 1027 |
+
+- sha256：`train_sft_ids.txt` `451668fc…a9f1`，`train_rl_ids.txt` `05933ff7…bbf`。
+- 干扰函数不受划分约束：RL 池 1953 道题里有 1920 道的干扰函数中含有 SFT 池的 bug 来源函数（干扰函数在构建时就是从整个训练侧取的）。bug 函数本身不重叠。
+- **和第 3 步的冲突**：第 3 步要求"同一道题最多 1 条、同一个来源函数最多 3 条"，SFT 池有 261 个函数，就算每道题都解出，筛选后最多也只有 668 条轨迹，低于 CHECKPOINT-2A-1 "少于 800 条就停下"的门槛。见下文。
+
+测试结果：`uv run pytest -q` → 218 passed。
