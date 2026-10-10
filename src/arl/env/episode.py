@@ -30,7 +30,12 @@ class PolicyContextExceeded(Exception):
     """
 
 TOOL_RESULT_MAX_CHARS = 4000
+MAX_TURNS = 10
 CONTEXT_MAX_TOKENS = 8000
+NUDGE_MESSAGE = (
+    "You have not changed any file yet. Use the tools to find and fix the bug, "
+    "then reply without a tool call to submit."
+)
 CHARS_PER_TOKEN = 4
 SYSTEM_PROMPT = (Path(__file__).with_name("prompt.md")).read_text(encoding="utf-8").strip()
 
@@ -79,6 +84,7 @@ class EpisodeResult:
     context_tokens_est: int
     duration_s: float
     meta: dict[str, Any] = field(default_factory=dict)
+    nudged: bool = False
 
     @property
     def format_errors(self) -> int:
@@ -136,7 +142,7 @@ def _execute(toolbox: Toolbox, name: str, arguments: str) -> tuple[bool, str, st
 def run_episode(
     task: Task,
     policy: Policy,
-    max_turns: int = 8,
+    max_turns: int = MAX_TURNS,
     *,
     sandbox: SandboxConfig | None = None,
     context_max_tokens: int = CONTEXT_MAX_TOKENS,
@@ -145,9 +151,11 @@ def run_episode(
 ) -> EpisodeResult:
     """Run one episode and grade it.
 
-    Each turn is one policy call. The episode ends when the policy answers without tool
-    calls (a submission), after ``max_turns`` turns, or when the estimated context
-    exceeds ``context_max_tokens`` (``truncated=True``). The workspace is graded in all cases.
+    Each turn is one policy call. A reply without tool calls is a submission, except the first
+    such reply in an episode with no successful ``edit_file`` yet: that one is answered with
+    ``NUDGE_MESSAGE`` (once per episode, ``nudged=True``) and the episode continues; the reply's
+    turn still counts. The episode also ends after ``max_turns`` turns, or when the estimated
+    context exceeds ``context_max_tokens`` (``truncated=True``). The workspace is graded in all cases.
     """
     start = time.monotonic()
     workspace = Path(tempfile.mkdtemp(prefix="arl-ep-", dir=workspace_dir))
@@ -158,6 +166,7 @@ def run_episode(
         records: list[ToolCallRecord] = []
         stop_reason = "max_turns"
         truncated = False
+        nudged = False
         turns = 0
 
         while turns < max_turns:
@@ -173,8 +182,13 @@ def run_episode(
             turns += 1
             messages.append(reply)
             if not reply.get("tool_calls"):
-                stop_reason = "submitted"
-                break
+                edited = any(r.name == "edit_file" and r.ok for r in records)
+                if nudged or edited:
+                    stop_reason = "submitted"
+                    break
+                nudged = True
+                messages.append({"role": "user", "content": NUDGE_MESSAGE})
+                continue
             for call in reply["tool_calls"]:
                 fn = call["function"]
                 ok, content, error_kind = _execute(toolbox, fn["name"], fn["arguments"])
@@ -208,6 +222,7 @@ def run_episode(
             context_tokens_est=estimate_tokens(messages),
             duration_s=round(time.monotonic() - start, 3),
             meta=dict(task.meta),
+            nudged=nudged,
         )
     finally:
         if not keep_workspace:

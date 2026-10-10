@@ -300,3 +300,25 @@
 - README 补上"生成题集"一节。"接入新 policy"和"启动推理服务"两节和环境修改一起提交，免得 tag 上的 README 描述还没提交的代码。
 
 测试结果：`uv run pytest -q` → 210 passed。
+
+## 审计修订 4 · 第 1 步（下）：环境修改 `phase1-env-v1`
+
+做了什么：
+- `episode.py`：
+  - 提醒一次：模型回复里没有工具调用，并且到这时为止一次 `edit_file` 都没成功过，环境就追加一条固定的 user 消息 `NUDGE_MESSAGE`（原文照修订 4），episode 继续。每个 episode 最多提醒 1 次。第二次没有工具调用视为提交；成功编辑过以后，没有工具调用直接视为提交。
+  - "提醒占 1 轮"的实现方式：触发提醒的那条回复照常计入 `turns`，提醒消息本身不另外计数。
+  - `EpisodeResult` 新增 `nudged: bool`（默认 False，旧记录照样能读）。`max_turns` 默认值从 8 改成 10（`MAX_TURNS`）。上下文上限 8k 不变。
+- `prompt.md`：末尾加了一段 JSON 格式说明，39 个英文词，原有内容不改。parser 不放宽。
+- `client.py`：
+  - `ClientConfig` 新增 `env_prefix`（从环境变量或 `.env` 读 `{prefix}_BASE_URL/_MODEL/_API_KEY`，环境变量优先；`.env` 用标准库逐行解析）、`extra_body`（Qwen3 的 `chat_template_kwargs`、DeepSeek 的 `thinking`）、`trust_env`、`price_cny_per_mtok`。
+  - `Usage` 新增 `cache_hit_tokens`（取 DeepSeek 的 `prompt_cache_hit_tokens`，没有就按 0 算）。不带工具的请求不发 `tools` 和 `tool_choice`。
+- `calibrate.py`：
+  - 每条记录新增：`nudged`、`nudge_turn`、`first_turn_tool_call`、`tool_call_after_nudge`、`edit_calls`、`edit_ok`、`run_tests_passed`、`cache_hit_tokens`、`cost_cny`；汇总里新增 `diagnostics` 一节。
+  - `CostLedger`：累计花费写到 `cost.json`。续跑时从已有记录恢复累计值；"已花费 + 正在跑的 episode 数 × 单个 episode 的最高花费"达到上限时，就不再启动新的 episode。
+  - `preflight` 子命令：发 1 条最短请求，验证密钥和模型名。
+  - 报错信息先去掉 `Authorization`、`Bearer` 和密钥本身，再写入记录。
+- `configs/deepseek.json`：`env_prefix=DEEPSEEK`，`thinking` 关闭，`max_tokens` 1024，单价 0.04 / 2.00 / 8.00 元/百万 token（和 A5 的 `model-price-binding.json` 核对一致）。
+- 网络：WSL 里直连 `api.deepseek.com` 是通的（不带密钥请求返回 401，耗时 0.13 秒），所以 `trust_env=false`，不读 `HTTPS_PROXY`。
+- README 补上"接入一个新的 policy""启动推理服务""付费 API"三节。
+
+测试结果：`uv run pytest -q` → 210 passed。新增的测试：提醒后继续并修好；第二次没有工具调用时视为提交；提醒计入轮数；编辑成功后不提醒；编辑失败不算编辑过；`nudged` 字段的序列化和旧记录兼容；JSON 说明不超过 60 词；`.env` 解析和环境变量优先；`extra_body` 和缓存命中计价；不带工具的请求；脱敏；花费上限和续跑；诊断指标。

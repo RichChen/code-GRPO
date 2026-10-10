@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from arl.env.episode import (
+    NUDGE_MESSAGE,
     SYSTEM_PROMPT,
     EpisodeResult,
     ScriptedPolicy,
@@ -60,9 +61,51 @@ def test_scripted_visible_test_cheater_gets_0(task):
     assert r.grade["visible_pass"] is False
 
 
-def test_submit_immediately_gets_0(task):
-    r = run_episode(task, ScriptedPolicy(["I give up."]))
-    assert r.reward == 0 and r.turns == 1 and r.stop_reason == "submitted" and r.tool_calls == []
+def test_submit_twice_without_edit_is_nudged_once_then_submitted(task):
+    r = run_episode(task, ScriptedPolicy(["I give up.", "Still giving up."]))
+    assert r.reward == 0 and r.turns == 2 and r.stop_reason == "submitted" and r.tool_calls == []
+    assert r.nudged is True
+    assert r.messages[3] == {"role": "user", "content": NUDGE_MESSAGE}
+    assert [m["role"] for m in r.messages] == ["system", "user", "assistant", "user", "assistant"]
+
+
+def test_nudge_then_continue_and_fix(task):
+    r = run_episode(task, ScriptedPolicy(["The bug is in add."] + SOLVER))
+    assert r.nudged is True and r.reward == 1 and r.stop_reason == "submitted" and r.turns == 7
+    assert sum(1 for m in r.messages if m.get("content") == NUDGE_MESSAGE) == 1
+
+
+def test_nudge_counts_as_a_turn(task):
+    r = run_episode(task, ScriptedPolicy(["thinking", [("list_dir", {})], [("list_dir", {})]]), max_turns=3)
+    assert r.nudged is True and r.turns == 3 and r.stop_reason == "max_turns"
+
+
+def test_no_nudge_after_successful_edit(task):
+    fix = ("edit_file", {"path": "pkg/nums.py", "old_string": "return a - b", "new_string": "return a + b"})
+    r = run_episode(task, ScriptedPolicy([[fix], "done"]))
+    assert r.nudged is False and r.turns == 2 and r.stop_reason == "submitted" and r.reward == 1
+    assert all(m.get("content") != NUDGE_MESSAGE for m in r.messages)
+
+
+def test_failed_edit_does_not_count_as_edited(task):
+    bad = ("edit_file", {"path": "pkg/nums.py", "old_string": "not there", "new_string": "x"})
+    r = run_episode(task, ScriptedPolicy([[bad], "done", "done again"]))
+    assert r.nudged is True and r.turns == 3 and r.stop_reason == "submitted"
+
+
+def test_nudged_field_round_trips(task):
+    r = run_episode(task, ScriptedPolicy(["a", "b"]))
+    back = EpisodeResult.from_dict(json.loads(r.to_json()))
+    assert back.nudged is True and json.loads(r.to_json())["nudged"] is True
+    old = json.loads(r.to_json())
+    del old["nudged"]
+    assert EpisodeResult.from_dict(old).nudged is False
+
+
+def test_prompt_has_json_format_note():
+    note = SYSTEM_PROMPT.split("\n\n")[-1]
+    assert note.startswith("Tool call format:") and len(note.split()) <= 60
+    assert 'r"..."' in note and "</tool_call>" in note
 
 
 def test_message_format(task):
@@ -87,7 +130,7 @@ def test_policy_receives_copies(task):
         return {"role": "assistant", "content": "done"}
 
     r = run_episode(task, mutating_policy)
-    assert r.messages[0]["role"] == "system" and len(r.messages) == 3
+    assert r.messages[0]["role"] == "system" and len(r.messages) == 5  # incl. the nudge and second reply
 
 
 def test_policy_gets_tool_schemas(task):
@@ -98,7 +141,7 @@ def test_policy_gets_tool_schemas(task):
         return {"role": "assistant", "content": "done"}
 
     run_episode(task, policy)
-    assert got == [TOOL_SCHEMAS]
+    assert got == [TOOL_SCHEMAS, TOOL_SCHEMAS]
 
 
 def test_max_turns(task):

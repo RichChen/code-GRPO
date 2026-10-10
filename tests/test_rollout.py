@@ -153,3 +153,95 @@ def test_stratified_sample_covers_functions_before_repeating():
 
 def test_request_seed_is_stable():
     assert request_seed("a", 1) == request_seed("a", 1) != request_seed("a", 2)
+
+
+# -- paid API config, cost and diagnostics -----------------------------------------------------------
+
+PRICES = {"cache_hit": 0.04, "cache_miss": 2.0, "output": 8.0}
+
+
+def test_dotenv_is_read_and_environment_wins(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text("# comment\nX_BASE_URL=https://api.example/v1\nX_MODEL='m-flash'\nX_API_KEY=k-from-file\n\n")
+    cfg = tmp_path / "c.json"
+    cfg.write_text(json.dumps({"env_prefix": "X", "extra_body": {"thinking": {"type": "disabled"}}}))
+    monkeypatch.delenv("X_API_KEY", raising=False)
+    monkeypatch.setenv("X_MODEL", "m-env")
+    c = ClientConfig.load(cfg, dotenv=env)
+    assert (c.base_url, c.model, c.api_key) == ("https://api.example/v1", "m-env", "k-from-file")
+    assert "api_key" not in c.to_dict()
+    env.write_text("X_BASE_URL=u\n")
+    monkeypatch.delenv("X_MODEL")
+    with pytest.raises(ValueError, match="X_MODEL"):
+        ClientConfig.load(cfg, dotenv=env)
+
+
+def test_extra_body_is_sent_and_cache_hits_are_priced():
+    r1 = reply(calls=[FIX], prompt=1000, completion=100)
+    r1.usage.prompt_cache_hit_tokens = 600
+    client = FakeClient([r1, reply("done", prompt=1200, completion=10)])  # no cache field: all misses
+    cfg = ClientConfig(extra_body={"chat_template_kwargs": {"enable_thinking": False}}, price_cny_per_mtok=PRICES)
+    policy = OpenAIPolicy(cfg, client=client)
+    run_episode(make_task(), policy)
+    assert client.requests[0]["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+    assert policy.usage.cache_hit_tokens == 600
+    expected = (600 * 0.04 + (2200 - 600) * 2.0 + 110 * 8.0) / 1e6
+    assert cfg.cost_cny(policy.usage) == pytest.approx(expected)
+
+
+def test_request_without_tools_omits_tool_choice():
+    client = FakeClient([reply("ok")])
+    OpenAIPolicy(ClientConfig(), client=client)([{"role": "user", "content": "Reply with ok."}], [])
+    assert "tools" not in client.requests[0] and "tool_choice" not in client.requests[0]
+
+
+def test_redact_removes_keys_and_authorization():
+    from arl.rollout.calibrate import redact
+    text = "401 headers={'Authorization': 'Bearer fake-secret-123456'} key fake-secret-123456 Bearer xyz"
+    out = redact(text, ["fake-secret-123456"])
+    assert "fake-secret-123456" not in out and "xyz" not in out and "[redacted]" in out
+
+
+def test_budget_stops_new_episodes(tmp_path):
+    from arl.rollout.calibrate import CostLedger
+
+    class Priced(ScriptedPolicy):
+        def __init__(self, turns):
+            super().__init__(turns)
+            self.config = ClientConfig(price_cny_per_mtok=PRICES)
+            self.usage = Usage(prompt_tokens=100_000)  # 0.2 CNY per episode
+
+    tasks = [toy(i) for i in range(10)]
+    ledger = CostLedger(tmp_path / "cost.json", 1.0, PRICES, [])
+    recs = run_calibration(tasks, tmp_path / "cal.jsonl", ClientConfig(), k=1, concurrency=1,
+                           policy_factory=lambda t, k: Priced([[FIX], "done"]), log=lambda *_: None, ledger=ledger)
+    assert len(recs) == 5 and ledger.spent == pytest.approx(1.0)
+    saved = json.loads((tmp_path / "cost.json").read_text())
+    assert saved["spent_cny"] == pytest.approx(1.0) and saved["episodes"] == 5
+    resumed = CostLedger(tmp_path / "cost.json", 1.0, PRICES, load_records(tmp_path / "cal.jsonl"))
+    assert resumed.spent == pytest.approx(1.0) and resumed.exhausted(0)
+
+
+def test_behaviour_metrics_in_records_and_summary(tmp_path):
+    from arl.rollout.calibrate import diagnostics
+
+    def factory(task, k):
+        turns = {0: ["thinking", [FIX], [("run_tests", {})], "done"],  # nudged, then fixes
+                 1: [[FIX], "done"],                                    # fixes straight away
+                 2: ["no", "still no"]}[k]
+        p = ScriptedPolicy(turns)
+        p.usage = Usage()
+        return p
+
+    recs = run_calibration([toy(0)], tmp_path / "cal.jsonl", ClientConfig(), k=3, concurrency=1,
+                           policy_factory=factory, log=lambda *_: None)
+    by_k = {r["k"]: r for r in recs}
+    assert by_k[0]["nudged"] and by_k[0]["nudge_turn"] == 1 and by_k[0]["tool_call_after_nudge"]
+    assert by_k[0]["run_tests_passed"] == 1 and by_k[0]["edit_ok"] == 1 and not by_k[0]["first_turn_tool_call"]
+    assert not by_k[1]["nudged"] and by_k[1]["first_turn_tool_call"]
+    assert by_k[2]["nudged"] and not by_k[2]["tool_call_after_nudge"] and by_k[2]["reward"] == 0
+    d = diagnostics(recs)
+    assert d["nudged"] == 0.667 and d["tool_call_after_nudge_of_nudged"] == 0.5
+    assert d["first_turn_no_tool_call"] == 0.667 and d["edit_success_rate"] == 1.0
+    assert d["episodes_with_successful_edit"] == 0.667 and d["episodes_visible_pass_any"] == 0.667
+    assert d["solved_turns_median"] == 3 and d["solved_turns_p90"] == 4

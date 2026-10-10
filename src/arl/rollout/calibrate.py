@@ -17,7 +17,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import random
+import re
 import statistics
 import sys
 import tempfile
@@ -29,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from arl.env.episode import FORMAT_ERROR_KINDS, EpisodeResult, run_episode
+from arl.env.episode import FORMAT_ERROR_KINDS, MAX_TURNS, NUDGE_MESSAGE, EpisodeResult, run_episode
 from arl.env.grader import grade
 from arl.env.task import Task, load_tasks
 from arl.rollout.client import ClientConfig, OpenAIPolicy
@@ -37,7 +39,7 @@ from arl.taskgen.sources import sha256_file
 
 K = 4
 CONCURRENCY = 8
-MAX_TURNS = 8
+
 RUNS = Path("runs/calibration")
 TASKS = Path("data/tasks")
 PILOT_PER_SPLIT = 50
@@ -46,6 +48,35 @@ TRAIN_MIN_SAMPLE = 1200
 
 def request_seed(task_id: str, k: int) -> int:
     return int(hashlib.sha256(f"{task_id}#{k}".encode()).hexdigest()[:8], 16) & 0x7FFFFFFF
+
+
+def policy_cost(policy: Any) -> float:
+    config = getattr(policy, "config", None)
+    return round(config.cost_cny(policy.usage), 6) if config is not None and hasattr(policy, "usage") else 0.0
+
+
+def behaviour(result: EpisodeResult) -> dict[str, Any]:
+    """Diagnostics for the model-selection scan: nudges, edits, visible tests passing during the episode."""
+    nudge_turn = None
+    assistant_turns = 0
+    run_tests_passed = 0
+    for m in result.messages:
+        if m["role"] == "assistant":
+            assistant_turns += 1
+        elif m["role"] == "user" and m.get("content") == NUDGE_MESSAGE:
+            nudge_turn = assistant_turns
+        elif m["role"] == "tool" and m.get("name") == "run_tests" and (m.get("content") or "").startswith("exit code: 0"):
+            run_tests_passed += 1
+    edits = [c for c in result.tool_calls if c.name == "edit_file"]
+    return {
+        "nudged": result.nudged,
+        "nudge_turn": nudge_turn,
+        "first_turn_tool_call": any(c.turn == 1 for c in result.tool_calls),
+        "tool_call_after_nudge": nudge_turn is not None and any(c.turn > nudge_turn for c in result.tool_calls),
+        "edit_calls": len(edits),
+        "edit_ok": sum(1 for c in edits if c.ok),
+        "run_tests_passed": run_tests_passed,
+    }
 
 
 def episode_record(task: Task, k: int, result: EpisodeResult, policy: OpenAIPolicy, session: str,
@@ -71,9 +102,12 @@ def episode_record(task: Task, k: int, result: EpisodeResult, policy: OpenAIPoli
         "model_calls": u.calls,
         "prompt_tokens": u.prompt_tokens,
         "completion_tokens": u.completion_tokens,
+        "cache_hit_tokens": u.cache_hit_tokens,
+        "cost_cny": policy_cost(policy),
         "final_context_tokens": u.final_context_tokens,
         "context_tokens_est": result.context_tokens_est,
         "finish_reasons": u.finish_reasons,
+        **behaviour(result),
         "grade": result.grade,
         "tool_calls": [c.__dict__ for c in result.tool_calls],
     }
@@ -103,10 +137,61 @@ def latest(records: Iterable[dict[str, Any]]) -> dict[tuple[str, int], dict[str,
     return out
 
 
+def redact(text: str, secrets: Iterable[str] = ()) -> str:
+    """Drop Authorization headers / bearer tokens and any known secret from an error message."""
+    text = re.sub(r"(?i)(authorization['\"]?\s*[:=]\s*['\"]?)[^'\",}\s]+(\s+[^'\",}\s]+)?", r"\1[redacted]", text)
+    text = re.sub(r"(?i)bearer\s+\S+", "Bearer [redacted]", text)
+    for s in secrets:
+        if s and len(s) >= 8:
+            text = text.replace(s, "[redacted]")
+    return text
+
+
+class CostLedger:
+    """Cumulative paid-API spend, persisted to ``path`` after every episode; resumes from the records."""
+
+    def __init__(self, path: Path, budget_cny: float, prices: dict[str, float] | None, records: list[dict[str, Any]]):
+        self.path, self.budget, self.prices = path, budget_cny, prices
+        prior = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        self.preflight = prior.get("preflight_cny", 0.0)
+        self.episodes_cny = sum(r.get("cost_cny", 0.0) for r in records)
+        self.episodes = sum(1 for r in records if "cost_cny" in r)
+        self.max_episode = max((r.get("cost_cny", 0.0) for r in records), default=0.0)
+        self.save()
+
+    @property
+    def spent(self) -> float:
+        return self.preflight + self.episodes_cny
+
+    def add(self, cost: float) -> None:
+        self.episodes_cny += cost
+        self.episodes += 1
+        self.max_episode = max(self.max_episode, cost)
+        self.save()
+
+    def exhausted(self, in_flight: int) -> bool:
+        """True once the spend, plus a worst-case allowance for the episodes still running, reaches the budget."""
+        return self.spent + in_flight * self.max_episode >= self.budget
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps({
+            "budget_cny": self.budget, "spent_cny": round(self.spent, 4), "preflight_cny": round(self.preflight, 6),
+            "episodes_cny": round(self.episodes_cny, 4), "episodes": self.episodes,
+            "mean_episode_cny": round(self.episodes_cny / self.episodes, 5) if self.episodes else None,
+            "max_episode_cny": round(self.max_episode, 5), "price_cny_per_mtok": self.prices,
+            "updated_at": round(time.time(), 1),
+        }, indent=2) + "\n", encoding="utf-8")
+
+
 def run_calibration(tasks: list[Task], out_path: Path, config: ClientConfig, k: int = K, concurrency: int = CONCURRENCY,
                     max_turns: int = MAX_TURNS, policy_factory: Callable[[Task, int], Any] | None = None,
-                    max_consecutive_errors: int = 20, log: Callable[[str], None] = print) -> list[dict[str, Any]]:
-    """Run every (task, k) episode not yet recorded in ``out_path``; return all records for these tasks."""
+                    max_consecutive_errors: int = 20, log: Callable[[str], None] = print,
+                    ledger: CostLedger | None = None) -> list[dict[str, Any]]:
+    """Run every (task, k) episode not yet recorded in ``out_path``; return all records for these tasks.
+
+    With a ``ledger``, no new episode starts once the budget would be reached (see ``CostLedger.exhausted``).
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     done = latest(load_records(out_path))
     pending = [(t, i) for i in range(k) for t in tasks if (t.task_id, i) not in done]
@@ -115,19 +200,33 @@ def run_calibration(tasks: list[Task], out_path: Path, config: ClientConfig, k: 
     lock = threading.Lock()
     errors = {"consecutive": 0, "total": 0}
     stop = threading.Event()
+    over_budget = threading.Event()
+    in_flight = {"n": 0}
     factory = policy_factory or (lambda task, i: OpenAIPolicy(config, seed=request_seed(task.task_id, i)))
 
     def one(task: Task, i: int) -> dict[str, Any] | None:
-        if stop.is_set():
-            return None
+        with lock:
+            if stop.is_set() or over_budget.is_set():
+                return None
+            if ledger is not None and ledger.exhausted(in_flight["n"]):
+                over_budget.set()
+                return None
+            in_flight["n"] += 1
         started = time.time()
+        policy = None
         try:
             policy = factory(task, i)
             result = run_episode(task, policy, max_turns=max_turns)
             rec = episode_record(task, i, result, policy, session, started)
         except Exception as exc:  # server errors etc.: record, retry on resume
-            rec = {"task_id": task.task_id, "k": i, "session": session, "error": f"{type(exc).__name__}: {exc}"[:500]}
+            rec = {"task_id": task.task_id, "k": i, "session": session,
+                   "error": redact(f"{type(exc).__name__}: {exc}", [config.api_key])[:500]}
+            if policy is not None:
+                rec["cost_cny"] = policy_cost(policy)
         with lock:
+            in_flight["n"] -= 1
+            if ledger is not None:
+                ledger.add(rec.get("cost_cny", 0.0))
             with open(out_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             if "error" in rec:
@@ -153,6 +252,8 @@ def run_calibration(tasks: list[Task], out_path: Path, config: ClientConfig, k: 
                 log(f"[calibrate] {n}/{len(pending)} episodes, {rate:.0f}/h, errors {errors['total']}")
     if stop.is_set():
         raise RuntimeError(f"stopped after {max_consecutive_errors} consecutive episode errors; see {out_path}")
+    if over_budget.is_set():
+        log(f"[calibrate] budget reached: spent {ledger.spent:.4f} of {ledger.budget} CNY; stopped launching episodes")
     ids = {t.task_id for t in tasks}
     return [r for r in latest(load_records(out_path)).values() if r["task_id"] in ids]
 
@@ -186,6 +287,43 @@ def throughput_per_hour(records: list[dict[str, Any]]) -> float | None:
 
 def _rate(xs: list[int]) -> float | None:
     return round(sum(xs) / len(xs), 3) if xs else None
+
+
+def _quantile(xs: list[int], q: float) -> float | None:
+    if not xs:
+        return None
+    xs = sorted(xs)
+    return xs[max(0, math.ceil(q * len(xs)) - 1)]  # nearest rank
+
+
+def diagnostics(recs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Behaviour metrics for the model-selection scan (records without them are counted from tool calls)."""
+    def first_turn_tool(r: dict[str, Any]) -> bool:
+        return r.get("first_turn_tool_call", any(c["turn"] == 1 for c in r["tool_calls"]))
+
+    edit_calls = sum(r.get("edit_calls", r["tool_names"].get("edit_file", 0)) for r in recs)
+    edit_ok = sum(r.get("edit_ok", sum(1 for c in r["tool_calls"] if c["name"] == "edit_file" and c["ok"])) for r in recs)
+    nudged = [r for r in recs if r.get("nudged")]
+    solved_turns = [r["turns"] for r in recs if r["reward"] == 1]
+    costs = [r["cost_cny"] for r in recs if "cost_cny" in r]
+    return {
+        "first_turn_no_tool_call": _rate([0 if first_turn_tool(r) else 1 for r in recs]),
+        "nudged": _rate([1 if r.get("nudged") else 0 for r in recs]),
+        "tool_call_after_nudge_of_nudged": _rate([1 if r.get("tool_call_after_nudge") else 0 for r in nudged]),
+        "edit_calls": edit_calls,
+        "edit_success_rate": round(edit_ok / edit_calls, 3) if edit_calls else None,
+        "episodes_with_successful_edit": _rate([1 if any(c["name"] == "edit_file" and c["ok"] for c in r["tool_calls"]) else 0
+                                                for r in recs]),
+        "episodes_visible_pass_final": _rate([1 if r["grade"]["visible_pass"] else 0 for r in recs]),
+        "episodes_run_tests_passed": _rate([1 if r.get("run_tests_passed") else 0 for r in recs]),
+        "episodes_visible_pass_any": _rate([1 if r["grade"]["visible_pass"] or r.get("run_tests_passed") else 0 for r in recs]),
+        "turns_distribution": dict(sorted(Counter(r["turns"] for r in recs).items())),
+        "solved_turns_median": statistics.median(solved_turns) if solved_turns else None,
+        "solved_turns_p90": _quantile(solved_turns, 0.9),
+        "solved_turns_distribution": dict(sorted(Counter(solved_turns).items())),
+        "cost_cny_total": round(sum(costs), 4) if costs else None,
+        "cost_cny_mean_per_episode": round(statistics.mean(costs), 5) if costs else None,
+    }
 
 
 def summarize(records: list[dict[str, Any]], tasks: dict[str, Task], k: int = K) -> dict[str, Any]:
@@ -222,6 +360,7 @@ def summarize(records: list[dict[str, Any]], tasks: dict[str, Task], k: int = K)
         "finish_reasons": dict(sum((Counter(r["finish_reasons"]) for r in recs), Counter())),
         "mean_episode_s": round(statistics.mean(r["duration_s"] for r in recs), 2) if recs else None,
         "throughput_episodes_per_hour": throughput_per_hour(recs),
+        "diagnostics": diagnostics(recs),
         "by_split": group(lambda t: t.meta["split"]),
         "by_bug_type": group(lambda t: t.meta["bug_type"]),
         "by_issue_template": group(lambda t: t.meta["issue_template"]),
@@ -304,9 +443,32 @@ def select(tasks_dir: Path, runs: Path, out_dir: Path, k: int = K) -> dict[str, 
     return summary
 
 
+def preflight(config: ClientConfig, cost_file: Path, budget_cny: float | None) -> int:
+    """One minimal request to check the key and the model name before any episode is run."""
+    policy = OpenAIPolicy(config)
+    try:
+        reply = policy([{"role": "user", "content": "Reply with ok."}], [])
+    except Exception as exc:
+        print(f"[preflight] FAILED: {redact(f'{type(exc).__name__}: {exc}', [config.api_key])[:500]}")
+        return 3
+    cost = policy_cost(policy)
+    if config.price_cny_per_mtok:
+        prior = json.loads(cost_file.read_text(encoding="utf-8")) if cost_file.exists() else {}
+        cost_file.parent.mkdir(parents=True, exist_ok=True)
+        cost_file.write_text(json.dumps({**prior, "budget_cny": budget_cny,
+                                         "preflight_cny": round(prior.get("preflight_cny", 0.0) + cost, 6),
+                                         "spent_cny": round(prior.get("spent_cny", 0.0) + cost, 4),
+                                         "price_cny_per_mtok": config.price_cny_per_mtok}, indent=2) + "\n",
+                             encoding="utf-8")
+    print(f"[preflight] ok: model={config.model} reply={reply.get('content')!r} "
+          f"usage={policy.usage.prompt_tokens}+{policy.usage.completion_tokens} tokens "
+          f"(cache hit {policy.usage.cache_hit_tokens}) cost={cost:.6f} CNY")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["pilot", "run", "select", "summary"])
+    ap.add_argument("command", choices=["pilot", "run", "select", "summary", "preflight"])
     ap.add_argument("--config", type=Path, default=Path("configs/rollout.json"))
     ap.add_argument("--tasks", type=Path, default=TASKS)
     ap.add_argument("--runs", type=Path, default=RUNS)
@@ -317,12 +479,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--k", type=int, default=K)
     ap.add_argument("--concurrency", type=int, default=CONCURRENCY)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--max-turns", type=int, default=MAX_TURNS)
+    ap.add_argument("--budget-cny", type=float, default=None, help="paid APIs: stop starting episodes at this spend")
+    ap.add_argument("--cost-file", type=Path, default=None, help="cumulative spend (default <runs>/cost.json)")
     a = ap.parse_args(argv)
+    cost_file = a.cost_file or a.runs / "cost.json"
 
     if a.command == "select":
         print(json.dumps(select(a.tasks, a.runs, a.out, a.k), indent=2, ensure_ascii=False))
         return 0
-    if a.command == "pilot":
+    if a.command == "preflight":
+        return preflight(ClientConfig.load(a.config), cost_file, a.budget_cny)
+    if a.command == "pilot" or (a.command == "summary" and not a.split):
         tasks, name = pilot_tasks(a.tasks, a.seed), a.name or "pilot"
     else:
         if not a.split:
@@ -337,7 +505,13 @@ def main(argv: list[str] | None = None) -> int:
         recs = [r for r in load_records(path) if r["task_id"] in by_id]
     else:
         config = ClientConfig.load(a.config)
-        recs = run_calibration(tasks, path, config, k=a.k, concurrency=a.concurrency)
+        ledger = None
+        if config.price_cny_per_mtok:
+            if a.budget_cny is None:
+                ap.error("--budget-cny is required for a priced (paid) API")
+            ledger = CostLedger(cost_file, a.budget_cny, config.price_cny_per_mtok, load_records(path))
+        recs = run_calibration(tasks, path, config, k=a.k, concurrency=a.concurrency, max_turns=a.max_turns,
+                               ledger=ledger)
     summary = summarize(recs, by_id, a.k)
     (a.runs / f"{name}-summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2, ensure_ascii=False))

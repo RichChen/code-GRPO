@@ -19,3 +19,5 @@ Rules:
 - Edit source files in `pkg/` only. Changes to tests are ignored.
 - Paths are relative to the repository root.
 - Turns are limited, so do not explore more than needed.
+
+Tool call format: tool arguments must be valid JSON. Escape every backslash inside strings (write `\\d`, not `\d`). Do not use Python raw strings such as `r"..."`. If a reply contains several `<tool_call>` blocks, close each one with `</tool_call>`.

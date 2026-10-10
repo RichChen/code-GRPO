@@ -1,8 +1,9 @@
-"""OpenAI-compatible chat client used as an episode policy (e.g. against a local vLLM server)."""
+"""OpenAI-compatible chat client used as an episode policy (a local vLLM server or a paid API)."""
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from dataclasses import asdict, dataclass, field, fields
@@ -14,6 +15,27 @@ import openai
 from arl.env.episode import Message, PolicyContextExceeded
 
 TOOL_CALL_MARKER = re.compile(r"<tool_call>|\"name\"\s*:\s*\"(read_file|search_code|list_dir|edit_file|run_tests)\"")
+DOTENV = Path(".env")
+
+
+def read_dotenv(path: str | Path = DOTENV) -> dict[str, str]:
+    """``KEY=VALUE`` lines of a .env file; blank lines and ``#`` comments are skipped."""
+    out: dict[str, str] = {}
+    p = Path(path)
+    if not p.exists():
+        return out
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        out[key.strip()] = value.strip().strip("'\"")
+    return out
+
+
+def env_value(key: str, dotenv: str | Path = DOTENV) -> str | None:
+    """An existing environment variable wins over the .env file."""
+    return os.environ.get(key) or read_dotenv(dotenv).get(key) or None
 
 
 @dataclass
@@ -26,9 +48,16 @@ class ClientConfig:
     max_tokens: int = 1024
     timeout_s: float = 300.0
     retries: int = 5
+    # read {env_prefix}_BASE_URL / _MODEL / _API_KEY from the environment or .env
+    env_prefix: str | None = None
+    extra_body: dict[str, Any] | None = None
+    # let the HTTP client pick up HTTPS_PROXY etc. from the environment
+    trust_env: bool = False
+    # CNY per million tokens: {"cache_hit": ..., "cache_miss": ..., "output": ...}
+    price_cny_per_mtok: dict[str, float] | None = None
 
     @classmethod
-    def load(cls, path: str | Path | None = None, **overrides: Any) -> "ClientConfig":
+    def load(cls, path: str | Path | None = None, dotenv: str | Path = DOTENV, **overrides: Any) -> "ClientConfig":
         data: dict[str, Any] = {}
         if path:
             data = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -37,6 +66,14 @@ class ClientConfig:
         unknown = set(data) - known
         if unknown:
             raise ValueError(f"unknown client config keys: {sorted(unknown)}")
+        prefix = data.get("env_prefix")
+        if prefix:
+            for name in ("base_url", "model", "api_key"):
+                key = f"{prefix}_{name.upper()}"
+                value = env_value(key, dotenv)
+                if not value:
+                    raise ValueError(f"{key} is not set in the environment or {dotenv}")
+                data[name] = value
         return cls(**data)
 
     def to_dict(self) -> dict[str, Any]:
@@ -44,12 +81,21 @@ class ClientConfig:
         d.pop("api_key")
         return d
 
+    def cost_cny(self, usage: "Usage") -> float:
+        p = self.price_cny_per_mtok
+        if not p:
+            return 0.0
+        miss = usage.prompt_tokens - usage.cache_hit_tokens
+        return (usage.cache_hit_tokens * p["cache_hit"] + miss * p["cache_miss"]
+                + usage.completion_tokens * p["output"]) / 1e6
+
 
 @dataclass
 class Usage:
     calls: int = 0
     prompt_tokens: int = 0  # summed over calls
     completion_tokens: int = 0  # summed over calls
+    cache_hit_tokens: int = 0  # summed over calls; DeepSeek's prompt_cache_hit_tokens, else 0
     last_prompt_tokens: int = 0
     last_completion_tokens: int = 0
     finish_reasons: dict[str, int] = field(default_factory=dict)
@@ -75,18 +121,23 @@ class OpenAIPolicy:
 
     def __init__(self, config: ClientConfig, client: Any | None = None, seed: int | None = None):
         self.config = config
-        self.client = client or openai.OpenAI(base_url=config.base_url, api_key=config.api_key,
-                                              timeout=config.timeout_s, max_retries=0)
+        self.client = client or openai.OpenAI(
+            base_url=config.base_url, api_key=config.api_key, timeout=config.timeout_s, max_retries=0,
+            http_client=openai.DefaultHttpxClient(trust_env=config.trust_env))
         self.seed = seed
         self.usage = Usage()
 
     def _create(self, messages: list[Message], tools: list[dict[str, Any]]) -> Any:
         kwargs: dict[str, Any] = dict(
-            model=self.config.model, messages=messages, tools=tools, tool_choice="auto",
+            model=self.config.model, messages=messages,
             temperature=self.config.temperature, top_p=self.config.top_p, max_tokens=self.config.max_tokens,
         )
+        if tools:
+            kwargs.update(tools=tools, tool_choice="auto")
         if self.seed is not None:
             kwargs["seed"] = self.seed + self.usage.calls
+        if self.config.extra_body:
+            kwargs["extra_body"] = self.config.extra_body
         delay = 2.0
         for attempt in range(self.config.retries + 1):
             try:
@@ -112,6 +163,7 @@ class OpenAIPolicy:
             self.usage.completion_tokens += u.completion_tokens
             self.usage.last_prompt_tokens = u.prompt_tokens
             self.usage.last_completion_tokens = u.completion_tokens
+            self.usage.cache_hit_tokens += getattr(u, "prompt_cache_hit_tokens", None) or 0
         reason = choice.finish_reason or "none"
         self.usage.finish_reasons[reason] = self.usage.finish_reasons.get(reason, 0) + 1
 
