@@ -259,3 +259,36 @@
 - `openai` 3.27 依赖的是 `httpx2`，不是 `httpx`，测试里改成 `import httpx2`。
 - 校准时如果构造 policy 就抛异常，原先不会写记录，改成也记为错误，续跑时重跑。
 - 抽查生成的用例时发现，不变量规则覆盖不到"语义约束"。例如 `find_Extra(arr1, arr2, n)` 要求 arr2 只比 arr1 少一个元素，生成的输入少了两个，期望值仍然是原始代码算出的确定结果，但在原题语境下不合理。详见 CHECKPOINT-1C 的抽样表，不再额外处理。
+
+## 第 6 步（试点触发停止条件，停下报告）
+
+做了什么：
+- 推理服务：vLLM 0.31.0（torch 2.13.0+cu130），装在独立 venv `~/.venvs/vllm`，不进项目依赖。模型 `Qwen/Qwen2.5-1.5B-Instruct`，HF 版本 `989aa7980e4cf806f80c7fef2b1adb7bc71aa306`，经代理从 Hugging Face 官方下载。完整命令：
+
+  ```bash
+  HF_HUB_OFFLINE=1 ~/.venvs/vllm/bin/vllm serve Qwen/Qwen2.5-1.5B-Instruct --dtype half --max-model-len 8192 \
+    --enable-auto-tool-choice --tool-call-parser hermes --host 127.0.0.1 --port 8000 --gpu-memory-utilization 0.85 --seed 0
+  ```
+
+  工具调用 parser 用 `hermes`（Qwen2.5 的模板输出 `<tool_call>{json}</tool_call>`）。attention 后端自动选了 `TRITON_ATTN`，因为算力 7.5 不支持 FlashAttention 2。
+- 冒烟测试：2 个 episode 端到端跑通，工具调用被解析成结构化 `tool_calls`，执行和判分都正常。
+- 试点：`uv run python -m arl.rollout.calibrate pilot`，train 和 heldout 各 50 题（seed 0，按来源函数分层），K=4，temperature 0.8，并发 8。
+
+结果：
+- 解出率 0%（0/400），解出次数在 [0.25, 0.75] 区间里的题 0%，格式错误率（按工具调用）37%。三项都触发 PHASE-1C-PROMPT 规定的停止条件，所以停下报告：没有换模型，没有调参数，没有跑全量校准，也没有做第 7 步。
+- 其他指标：平均 1.85 轮；每个 episode 平均生成 220 token，最终上下文 1265 token；停止原因 submitted 398、max_turns 2；吞吐量 5556 episode/小时，估算全量耗时 1.9–3.4 小时。
+- 原因分析：
+  - 205/400 个 episode 第一轮就回复纯文本、不调工具，按环境规则视为提交；
+  - 工具调用的 JSON 经常不合法（比如写 Python 原始字符串 `r"..."`）；
+  - `edit_file` 14 次全部失败，400 个 episode 没有一次改动过文件。
+  - 链路本身没有问题。详见 `CHECKPOINT-1C.md`。
+- 报告写完后关掉了 vLLM 服务。
+
+测试结果：`uv run pytest -q` → 198 passed（约 74 秒，代码和第 5b 步相同）。
+
+遇到的问题：
+- vLLM 第一次启动失败：Triton 初始化需要 C 编译器，WSL 里没有 gcc，sudo 又需要密码。用户执行 `sudo apt install -y gcc libc6-dev` 后启动正常。
+
+## CHECKPOINT-1C
+
+`docs/plan/CHECKPOINT-1C.md` 已改写为正式版：第 5b 步完成，第 6 步试点触发停止条件，第 7 步未做。原来的提前停下版移到了附录 A。等审计方决定，没有开始阶段 2。
