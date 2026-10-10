@@ -190,9 +190,26 @@ class GradeResult:
     isolation: str
     setup_error: str | None = None
     case_passed: list[bool] | None = None
+    # analysis only, never part of the reward: {kind: [passed, total]} over task.meta["hidden_case_kinds"]
+    hidden_by_kind: dict[str, list[int]] | None = None
+    # every non-``generated`` (test + challenge) hidden case passed and the run did not time out
+    pass_non_generated: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def kind_breakdown(kinds: list[str] | None, passed: list[bool], timed_out: bool) -> tuple[dict[str, list[int]] | None, bool | None]:
+    """Per-kind pass counts and the "test + challenge only" verdict; ``(None, None)`` without kind labels."""
+    if not kinds or len(kinds) != len(passed):
+        return None, None
+    by_kind: dict[str, list[int]] = {}
+    for kind, ok in zip(kinds, passed):
+        counts = by_kind.setdefault(kind, [0, 0])
+        counts[0] += int(ok)
+        counts[1] += 1
+    non_generated = all(ok for kind, ok in zip(kinds, passed) if kind != "generated")
+    return by_kind, non_generated and not timed_out
 
 
 def _strip_test_files(root: Path) -> None:
@@ -328,6 +345,7 @@ def grade(
             visible_copy = _clean_copy(task, workspace, Path(tmp) / "visible")
             visible = run_visible(task, visible_copy, cfg)
     count = sum(passed)
+    by_kind, non_generated = kind_breakdown(task.meta.get("hidden_case_kinds"), passed, timed_out)
     return GradeResult(
         reward=int(count == len(task.hidden_cases) and not timed_out),
         hidden_pass_count=count,
@@ -338,4 +356,6 @@ def grade(
         isolation=isolation,
         setup_error=setup_error,
         case_passed=passed,
+        hidden_by_kind=by_kind,
+        pass_non_generated=non_generated,
     )

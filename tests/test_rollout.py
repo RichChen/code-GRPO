@@ -247,6 +247,22 @@ def test_behaviour_metrics_in_records_and_summary(tmp_path):
     assert d["solved_turns_median"] == 3 and d["solved_turns_p90"] == 4
 
 
+def test_regrade_matches_recorded_rewards(tmp_path):
+    from arl.rollout.regrade import regrade
+
+    tasks = [toy(0), toy(1)]
+    for t in tasks:
+        t.meta["hidden_case_kinds"] = ["test", "challenge", "generated"]
+    path = tmp_path / "cal.jsonl"
+    recs = run_calibration(tasks, path, ClientConfig(), k=2, concurrency=2, policy_factory=scripted, log=lambda *_: None)
+    r = regrade(recs, {t.task_id: t for t in tasks}, workers=2)
+    assert r["episodes"] == 4 and r["reward_mismatches"] == 0 and r["field_mismatches"] == {}
+    assert r["reward_1"] == 2 and r["pass_non_generated"] == 2
+
+    forged = [dict(recs[0], reward=1 - recs[0]["reward"])]
+    assert regrade(forged, {t.task_id: t for t in tasks}, workers=1)["reward_mismatches"] == 1
+
+
 def test_generated_only_failures():
     from arl.rollout.falseneg import generated_only_failures
 

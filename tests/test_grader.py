@@ -67,6 +67,41 @@ def test_syntax_error_gives_setup_error(task, workspace):
     assert g.setup_error == "SyntaxError"
 
 
+def test_hidden_by_kind_is_recorded_without_changing_the_reward(task, workspace):
+    # unchanged code passes only add(10, 0), the third case
+    task.meta["hidden_case_kinds"] = ["generated", "generated", "test"]
+    g = grade(task, workspace, check_visible=False)
+    assert g.reward == 0 and g.case_passed == [False, False, True]
+    assert g.hidden_by_kind == {"generated": [0, 2], "test": [1, 1]}
+    assert g.pass_non_generated is True
+
+    task.meta["hidden_case_kinds"] = ["test", "challenge", "generated"]
+    g = grade(task, workspace, check_visible=False)
+    assert g.hidden_by_kind == {"test": [0, 1], "challenge": [0, 1], "generated": [1, 1]}
+    assert g.reward == 0 and g.pass_non_generated is False
+
+    fix(workspace)
+    g = grade(task, workspace, check_visible=False)
+    assert g.reward == 1 and g.pass_non_generated is True
+
+
+def test_hidden_by_kind_defaults_to_empty(task, workspace):
+    from arl.env.grader import GradeResult
+
+    g = grade(task, workspace, check_visible=False)
+    assert g.hidden_by_kind is None and g.pass_non_generated is None
+    old = {k: v for k, v in g.to_dict().items() if k not in ("hidden_by_kind", "pass_non_generated")}
+    assert GradeResult(**old) == g  # records written before these fields still load
+
+
+def test_kind_breakdown_counts_a_timeout_as_failing():
+    from arl.env.grader import kind_breakdown
+
+    assert kind_breakdown(["test", "generated"], [True, False], timed_out=False) == ({"test": [1, 1], "generated": [0, 1]}, True)
+    assert kind_breakdown(["test", "generated"], [True, False], timed_out=True)[1] is False
+    assert kind_breakdown(["test"], [True, False], timed_out=False) == (None, None)  # length mismatch
+
+
 def test_hidden_timeout(task, workspace):
     (workspace / "pkg" / "nums.py").write_text("def add(a, b):\n    while True:\n        pass\n")
     from arl.env.sandbox import SandboxConfig

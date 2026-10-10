@@ -405,3 +405,29 @@
 ## CHECKPOINT-1D
 
 写好了 `docs/plan/CHECKPOINT-1D.md`。没有写训练代码，没有跑全量校准，没有开始阶段 2。
+
+---
+
+# 阶段 2A 进度记录
+
+计划见 `docs/plan/PHASE-2-SFT.zh-CN.md`。计划文档和启动 prompt 单独提交。
+
+## 第 0 步：判分按用例类型分别记录（不改奖励）
+
+做了什么：
+- `GradeResult` 新增两个字段，都只用于分析，默认 `None`：
+  - `hidden_by_kind: {kind: [pass, total]}`，`kind` 取自 `task.meta["hidden_case_kinds"]`（`test` / `challenge` / `generated`，只列出这道题里有的类型）；
+  - `pass_non_generated`：全部 `test` 和 `challenge` 隐藏用例都过、并且没有超时。
+  - 题目没有 `hidden_case_kinds`（或长度对不上）时两个字段都是 `None`。奖励的计算没有改动。
+  - 旧 JSONL 里的 `grade` 字典没有这两个键，`GradeResult(**old)` 照样能构造（加了测试）。
+- 新增 `arl.rollout.regrade`：按 falseneg 的方法重放成功的 `edit_file` 复原最终工作区，用新判分重新判，逐条比较 `reward`、`hidden_pass_count`、`hidden_total`、`case_passed`、`visible_pass`、`timed_out`、`setup_error`。
+
+结果（`uv run python -m arl.rollout.regrade runs/diag/qwen3-1.7b.jsonl --out runs/regrade`，`runs/diag/qwen3-1.7b*.jsonl` 只匹配这一个文件）：
+- 400 个 episode，**奖励不同 0 条**；上面列的其他字段也全部相同。
+- 奖励 1 的 71 条（17.75%，和诊断扫描一致）；`pass_non_generated` 为 True 的 96 条，差的 25 条正好是 falseneg 的"字面条件"数。
+- 用例类型：400 个 episode 的题都有 `test` 和 `generated`，40 个有 `challenge`。
+- 耗时 35 秒（8 线程）。
+
+测试结果：`uv run pytest -q` → 215 passed（新增 4 个：按类型记录且不改奖励、默认为空和旧记录兼容、超时算失败、regrade 能发现不一致）。
+
+提交后打 tag `phase2-grader-v1`。
