@@ -10,3 +10,8 @@ data/tasks/*.jsonl
 .env
 .env.*
 !.env.example
+
+# SFT data: only the stats are committed
+data/sft/**
+!data/sft/**/
+!data/sft/**/stats.json

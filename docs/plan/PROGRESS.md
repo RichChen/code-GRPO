@@ -496,3 +496,61 @@
 - 单价比 CHECKPOINT-1D 的估算（每条成功轨迹 0.0076 元）高一些，因为补跑的都是难题。
 
 测试结果：`uv run pytest -q` → 229 passed，2 skipped（`tests/train/` 的两个文件在主项目环境里跳过）。
+
+## 第 3 步：构建 SFT 数据集 `src/arl/sft/data.py`
+
+做了什么：
+- 运行环境：渲染要用 Qwen3-1.7B 的 tokenizer 和 vLLM 的 hermes parser，所以在 `~/.venvs/vllm` 里跑（`PYTHONPATH=src HF_HUB_OFFLINE=1 ~/.venvs/vllm/bin/python -m arl.sft.data build`），用的 transformers 就是推理时渲染 prompt 的那一份。筛选部分是纯 Python，主项目可以测。
+- 为了测试，在 `~/.venvs/vllm` 里加装了 pytest 9.1.1（和主项目同版本），没有动其他包。
+- **筛选**，按计划顺序取第一个不满足的原因计数：没解出、格式错误（含 `unparsed_tool_calls`）、被提醒、被截断、轮数超过 8、改了 `pkg/` 以外的文件（或什么都没改）。然后同一道题只留 `k` 最小的一条；同一个来源函数最多 3 条，按 `sftdata-0` 打乱后选取，优先选还没选过的 bug 类型。
+- **渲染：每个 assistant 轮单独做一个样本。** 原因：Qwen3 的模板对"历史中、不是最后一条、没有 reasoning"的 assistant 消息不输出 think 块，而 `enable_thinking=False` 的生成前缀以 `<think>\n\n</think>\n\n` 结尾。整条轨迹渲染成一个序列时，除最后一轮外，其余每一轮的 token 都和推理时模型看到的不一样（`tests/train/test_sft_render.py` 里有这个反例）。所以第 t 轮的样本 = 第 t 轮之前全部消息加生成前缀（mask 掉）+ 这一轮的输出 + `<|im_end|>`（算 loss）。空 think 块属于推理时的 prompt，不是模型生成的，因此在 mask 里。
+  - 工具调用转成 `<tool_call>\n{"name": ..., "arguments": ...}\n</tool_call>`，参数用 `json.dumps(..., ensure_ascii=False)`；有 content 时，content 和第一个工具调用之间用 `\n` 分隔，多个工具调用之间也用 `\n` 分隔，和模板一致。
+  - 传给模板的消息先把 `arguments` 从 JSON 字符串解析成 dict，这一步和 vLLM 渲染前的处理一致；tools 用 `arl.env.tools.TOOL_SCHEMAS`。
+- **一致性检查**，每条轨迹的每个 assistant 轮都做，任何一项不过，整条轨迹丢弃：
+  - 文本：模板渲染到第 t 轮（含）的结果 == 前缀 + 这一轮的文本 + `<|im_end|>\n`；
+  - token：`encode(前缀) + encode(这一轮的文本) + [<|im_end|>]` 和整段文本一起 encode 的结果逐个相同；
+  - 解析：把这一轮的文本交给 vLLM 的 `Hermes2ProToolParser.extract_tool_calls`，工具名、参数（解析成 dict 后比较）、content（去掉首尾空白后比较）都要和原轨迹一致。
+- **额外做了一项服务端比对**（`arl.sft.data crosscheck`）：用诊断扫描时完全相同的参数起 vLLM（Qwen3-1.7B），对每个样本，把原始 OpenAI 格式的消息、tools 和 `enable_thinking=False` 发给 `/tokenize`，结果和数据里的前缀逐 token 比较。反向检查：去掉 `enable_thinking=False`，或者去掉 tools，都比对不上，说明这项比对是有区分力的。
+- 验证集：按来源函数用 `sftval-0` 打乱，取 5%（向上取整，13 个函数）。
+- 输出 `data/sft/v1/{train,val}.jsonl`，每行是 `traj_id`、`task_id`、`turn`、`input_ids`、`loss_start`。还有 `stats.json`。`.gitignore` 忽略 `data/sft/**`，只放行 `stats.json`。
+- `show` 子命令：随机抽样本，解码后标出 loss 边界，供人工检查。
+
+## CHECKPOINT-2A-1（阶段性结果）
+
+- **花费**：9.845 元（试点 0.1154 元，已包含在内），上限 15 元。
+- **成功率**：首轮 87.2%，补跑 34.1%，SFT 池 91.6% 的题有成功轨迹（1171/1279）。
+- **筛选**：1443 个 episode → 634 条轨迹（3163 个按轮样本）。
+
+  | 丢弃原因 | 条数 |
+  | --- | --- |
+  | 没解出 | 272 |
+  | 格式错误 | 1 |
+  | 被提醒 | 11 |
+  | 被截断 | 0 |
+  | 轮数超过 8 | 37 |
+  | 改了 `pkg/` 以外的文件 | 0 |
+  | 同一题重复 | 0（补跑只在首轮失败时发生，所以每道题最多一条成功） |
+  | 超过每个来源函数 3 条 | 488 |
+  | 一致性检查不过 | 0 |
+
+- **一致性测试**：634 条轨迹、3163 个 assistant 轮，三项检查全部通过，不一致 0%（门槛 2%）。vLLM 服务端 `/tokenize` 比对 3163 个前缀，不一致 0 个。
+- **数据集统计**（train / val）：
+
+  | | train | val |
+  | --- | --- | --- |
+  | 轨迹 | 598 | 36 |
+  | 按轮样本 | 2979 | 184 |
+  | 来源函数 | 243 | 13 |
+  | 样本长度中位数 / p95 / 最大（token） | 1489 / 2332 / 4039 | 1526 / 2424 / 3373 |
+  | 整条轨迹最后一轮的长度 中位数 / p95 / 最大 | 1720 / 2584 / 4039 | 1766 / 2612 / 3373 |
+  | 总 token / assistant token | 4,527,736 / 149,419 | 282,615 / 10,425 |
+  | assistant token 占比 | 3.3% | 3.7% |
+  | 超过 8192 的样本 | 0 | 0 |
+  | 轮数 4/5/6/7/8 | 190/322/19/41/26 | 5/26/1/4/0 |
+  | arith / bool / compare / const / remove_branch / var | 127/15/71/157/101/127 | 8/1/1/12/4/10 |
+
+  每个按轮样本都要重算整个前缀，所以训练的 token 量（每个 epoch 约 453 万）是按整条轨迹算的约 4.2 倍（按最后一轮长度合计约 109 万）。
+- **随机抽 3 个样本**（`show --n 3 --seed 0`，system prompt 和过长的工具结果只在展示时缩短）：完整文本见 CHECKPOINT-2A 附录 A。三个样本的 loss 都从生成前缀 `<think>\n\n</think>\n\n` 之后开始，到 `<|im_end|>` 结束；前缀里的历史 assistant 轮都没有 think 块。
+- **停止**：筛选后 634 条，少于 800 条，按计划停下报告。这在第 1 步就能确定（SFT 池的理论上限是 668 条），用户确认后照计划采完并构建了数据集。第 4–6 步没有执行，详见 `docs/plan/CHECKPOINT-2A.md`。
+
+测试结果：`uv run pytest -q` → 229 passed，2 skipped；`~/.venvs/vllm` 里跑 `tests/train/test_sft_render.py` 和 `tests/test_sft_data.py` → 9 passed。
