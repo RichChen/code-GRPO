@@ -649,3 +649,16 @@ CHECKPOINT-2A-1 审计通过。本轮按修订 2A-1 重建数据集，再做第 
 `docs/plan/CHECKPOINT-2A.md` 已重写，上一轮的提前停下版挪到附录 B。本阶段付费 API 共花 12.026 元（上限 25 元）。按要求停在这里，没有写 RL 代码，没有跑留出集，没有租服务器。
 
 测试结果：`uv run pytest -q` → 231 passed，2 skipped；`~/.venvs/vllm` 全量 → 235 passed，1 skipped；`~/.venvs/train` 里跑 `tests/train/` → 9 passed，1 skipped。
+
+# Phase 2C：租卡前的本地准备
+
+CHECKPOINT-2A 审计通过。审计修订 2A-2 补在 `PHASE-2-SFT.zh-CN.md` 末尾，替换原阶段 2B，单独提交（`625ba57`）。
+
+## 第 1 步（一）：冻结 SFT-v1
+
+- `runs/sft-preview/adapter-epoch2` 复制到 `runs/sft-v1/adapter/`（fp32 LoRA，不入库）。
+- `configs/sft/v1.json` 记录：基座快照 `70d244cc86cc`、适配器三个文件的 sha256、训练数据 `data/sft/v2` 三个文件的 sha256、训练配置路径。
+- `tests/test_sft_v1.py` 核对这些 sha256；适配器不在本地时跳过。
+- tag `sft-v1`。
+
+测试结果：`uv run pytest -q` → 233 passed，2 skipped。

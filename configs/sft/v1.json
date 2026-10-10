@@ -1,0 +1,23 @@
+{
+  "name": "sft-v1",
+  "note": "Audit revision 2A-2: the local fp16 SFT preview (runs/sft-preview/adapter-epoch2) is SFT-v1. On the server, merge this fp32 LoRA adapter into the bf16 base, not the local fp16 merged/ model.",
+  "base_model": "Qwen/Qwen3-1.7B",
+  "base_revision": "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e",
+  "adapter_dir": "runs/sft-v1/adapter",
+  "adapter_source": "runs/sft-preview/adapter-epoch2",
+  "adapter_dtype": "float32",
+  "adapter_sha256": {
+    "adapter_config.json": "9ee4b14dc4ab1c5b4998d53bff07ac3a4bf40e074e578d2ff1518045174b7dbe",
+    "adapter_model.safetensors": "7365aa36b89cbad4dff9782ff109c2376937f54b981daf4c57705f3d6ed1a9e2",
+    "README.md": "7580bf8de69547f09962e6e9ac8f70b2d0dcfb140bbdc2e97aa6237e950ff449"
+  },
+  "train_data": "data/sft/v2",
+  "train_data_sha256": {
+    "train.jsonl": "b901944257a4bef2800ae5750e11be7ac7b524a5d5a823c67da07b2ae14f3168",
+    "val.jsonl": "b4a0f28d9e1022719db0c2bafa4a4a53396ec643621fe26d34d7887e617e1572",
+    "stats.json": "7706d501824b56cf98e3380fdb435ca38e2cb51ffa0c837ad440a9c45ecd1ad2"
+  },
+  "train_config": "configs/sft/preview.json",
+  "local_merged_fp16": "runs/sft-preview/merged",
+  "dev_strict_solve_rate": 0.535
+}
