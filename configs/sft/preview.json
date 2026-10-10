@@ -12,6 +12,7 @@
   "autocast_dtype": "float16",
   "grad_scaler": true,
   "gradient_checkpointing": true,
+  "cuda_memory_limit_gib": 10.0,
   "max_seq_len": 8192,
   "micro_batch_size": 1,
   "grad_accum": 16,

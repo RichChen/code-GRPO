@@ -610,3 +610,42 @@ CHECKPOINT-2A-1 审计通过。本轮按修订 2A-1 重建数据集，再做第 
 - **训练配置**（为第 4 步准备）：数据改为 v2；写明 `adam_betas [0.9, 0.999]`；新增停止条件 `max_skipped_fraction 0.05`，即 GradScaler 跳过的步数超过总步数的 5% 就停止。训练日志新增累计跳过步数，summary 新增跳过比例。新增 GPU 测试：把初始 scale 设成 2^60 强制溢出，第 2 个被跳过的步就会停下。
 
 测试结果：`uv run pytest -q` → 230 passed，2 skipped；`~/.venvs/vllm` 全量 → 234 passed，1 skipped；`~/.venvs/train` 里跑 `tests/train/` → 9 passed，1 skipped（训练环境没有 `openai`，其余测试不在这里跑）。
+
+## 第 4 步：本地 SFT 预览（数据 v2）
+
+- **第一次启动卡在初始验证**：
+  - 现象：27 分钟还没算完 40 万 token 的前向。
+  - 原因：样本长度不一，缓存分配器产生碎片，保留显存涨过整张卡；WSL 不报 OOM，而是溢出到系统内存，速度慢了上百倍。
+  - 处理：训练模块在 import torch 之前设 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`；配置新增 `cuda_memory_limit_gib` 10.0，超过上限时直接报 OOM。这两项不改模型、精度和超参数。
+  - 第一次的日志在 `runs/sft-preview-attempt1/`。
+- **第二次正常跑完**：
+  - 520 / 520 步，被 GradScaler 跳过 0 步，loss scale 始终是 65536；
+  - 吞吐量平均 954 token/秒（第 20 步估算 885 token/秒，预计 3.98 小时）；
+  - 显存峰值 9.16 GiB（保留 9.69 GiB）；
+  - 纯训练 3.69 小时，墙钟 3.97 小时；
+  - val loss 2.306 → 0.4569（第 100 步）→ 0.4213（epoch 1 结束）→ 0.4140（epoch 2 结束）。
+- 合并后的 fp16 模型在 `runs/sft-preview/merged/`。tokenizer 文件和 `generation_config.json` 和基座快照逐字节相同。
+
+## 第 5 步：dev 评测（三列）
+
+- 基座和 SFT 模型用 `scripts/eval_dev.sh` 评测；SFT 的客户端配置是 `configs/sft/eval-preview.json`。
+- DeepSeek 用 `calibrate run --ids data/tasks/dev_ids.txt --k 4 --config configs/deepseek.json --runs runs/deepseek-dev --budget-cny 5`，花费 2.181 元。
+- 三组都是 400 个 episode，报错 0。
+
+| | 基座 | SFT 预览 | DeepSeek |
+| --- | --- | --- | --- |
+| 严格解出率 | 20.3% | 53.5% | 90.2% |
+| 只看 test 和 challenge | 26.0% | 58.0% | 95.8% |
+| 解出 1–3 次的题 | 17 | 43 | 9 |
+| 被提醒过的 episode | 36.5% | 3.7% | 0.3% |
+| 用满 10 轮 | 51 | 100 | 3 |
+
+- 配对差（SFT 减基座）：严格口径 +33.3 个百分点，95% 区间 [+24.8, +41.8]；只看 test 和 challenge 是 +32.0，区间 [+23.3, +40.5]。
+- 按 SFT 模型解出 1–3 次的比例（43%）换算，`rl_train_ids` 的 1853 题里约剩 797 题，区间 611–982。
+- `arl.sft.evaluate` 新增 `--reference`（第三列，加上"哪些题能解"的统计）和 `--rl-train-ids`（校准估计），并补了测试。
+
+## 第 6 步：CHECKPOINT-2A
+
+`docs/plan/CHECKPOINT-2A.md` 已重写，上一轮的提前停下版挪到附录 B。本阶段付费 API 共花 12.026 元（上限 25 元）。按要求停在这里，没有写 RL 代码，没有跑留出集，没有租服务器。
+
+测试结果：`uv run pytest -q` → 231 passed，2 skipped；`~/.venvs/vllm` 全量 → 235 passed，1 skipped；`~/.venvs/train` 里跑 `tests/train/` → 9 passed，1 skipped。

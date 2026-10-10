@@ -9,8 +9,9 @@ records every ``log_every`` steps, val records at step 0, every ``eval_every`` s
 Every step is checked. Any stop condition of the plan (non-finite loss, loss scale below ``min_scale`` or
 dropping for ``max_consecutive_skipped_steps`` steps in a row, more than ``max_skipped_fraction`` of all
 optimizer steps skipped by the GradScaler, OOM, estimated time over ``max_hours``, val loss after epoch 1 not
-below the initial one) writes a ``stop`` record and exits with status 4; nothing is
-changed and retried. After training the adapter is merged into the base and saved as fp16 in
+below the initial one) writes a ``stop`` record and exits with status 4; nothing is changed and retried.
+``cuda_memory_limit_gib`` caps PyTorch's share of the card so that running out of memory is an OOM, not a
+silent spill into system memory. After training the adapter is merged into the base and saved as fp16 in
 ``<out_dir>/merged`` together with the base model's own tokenizer files.
 """
 
@@ -19,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import shutil
 import sys
@@ -26,7 +28,11 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-import torch
+# Under WSL an allocation past the card's memory spills into shared system memory instead of failing, and
+# varying sequence lengths fragment the default allocator until it does: training then runs ~100x slower.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import torch  # noqa: E402
 import torch.nn.functional as F
 
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt", "generation_config.json")
@@ -159,6 +165,9 @@ def train(cfg: dict[str, Any], model: Any = None, device: str = "cuda",
 
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
+        if cfg.get("cuda_memory_limit_gib"):
+            total = torch.cuda.get_device_properties(device).total_memory
+            torch.cuda.set_per_process_memory_fraction(min(1.0, cfg["cuda_memory_limit_gib"] * 2**30 / total))
     if model is None:
         model = load_base(cfg, device)
     model = apply_lora(model, cfg)

@@ -1,4 +1,4 @@
-from arl.sft.evaluate import bootstrap_ci, compare, per_task_rates
+from arl.sft.evaluate import bootstrap_ci, calibration_estimate, compare, per_task_rates
 from test_rollout import toy
 
 
@@ -35,3 +35,21 @@ def test_compare_reports_both_models_and_paired_differences():
     assert out["paired_strict"]["mean_diff"] == round((0.25 + 0.5 + 0.5) / 3, 4)
     assert out["paired_strict"]["tasks_better"] == 3
     assert out["paired_test_challenge"]["mean_diff"] == 0.75
+
+
+def test_reference_column_headroom_and_calibration_estimate():
+    tasks = {f"toy-{i}": toy(i) for i in range(4)}
+    base = [rec(t, k, int(t == "toy-0"), True) for t in tasks for k in range(4)]  # toy-0 4/4
+    sft = [rec(t, k, int(t in ("toy-0", "toy-1") and k < 2), True) for t in tasks for k in range(4)]  # 2/4, 2/4
+    ref = [rec(t, k, int(t != "toy-3"), True) for t in tasks for k in range(4)]  # toy-3 never
+    out = compare(base, sft, tasks, ref, pool_size=1000)
+    assert out["reference"]["solve_rate_strict"] == 0.75
+    assert out["headroom"] == {"reference_solved_at_least_once": 3, "reference_never_solved": 1,
+                               "base_never_solved_but_reference_did": 2, "base_solved_but_reference_never": 0,
+                               "sft_never_solved_but_reference_did": 1, "sft_solved_but_reference_never": 0}
+    est = out["rl_train_calibration_estimate"]
+    assert est["dev_tasks_solved_1_to_3"] == 2 and est["fraction"] == 0.5 and est["estimated_kept"] == 500
+    lo, hi = est["estimated_kept_ci95"]
+    assert lo <= 500 <= hi
+    assert "reference" not in compare(base, sft, tasks)
+    assert calibration_estimate(sft, tasks, 10)["estimated_kept"] == 5
