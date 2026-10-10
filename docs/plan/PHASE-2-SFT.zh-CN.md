@@ -1,0 +1,154 @@
+# 阶段 2：SFT 轨迹采集与本地 SFT 预览
+
+> 执行方：Cursor agent，在 WSL 的 `~/agentic-rl` 里工作。审计方：Claude Code。
+> 本阶段分两部分。2A 在本机做：采轨迹、构建 SFT 数据、本地 fp16 预览训练和评测。2B 在租的 4090 上做：正式的 bf16 SFT，加上原计划阶段 0 的 GRPO 框架冒烟测试。本文件只写 2A，2B 等 CHECKPOINT-2A 审计后再写。
+
+## 0. 审计结论（不要改）
+
+1. **阶段 1 已完成。** 题集 `phase1-tasks-v1`、环境 `phase1-env-v1` 都已冻结。原第 6 步的"按 [0.25, 0.75] 筛题"按修订 4 挪到了正式 SFT 之后，不算阶段 1 的遗留。
+2. **基座选 `Qwen/Qwen3-1.7B`，关闭思考模式。** 理由：
+   - 四个能跑起来的模型里，它各项指标都最好，吞吐量是 3B 的 2.6 倍；
+   - 原始模型已经有 17.7% 的解出率，每题 4 次里解出次数分布在 0 到 4 之间，有区分度；
+   - 4090 上做 LoRA GRPO 余量充足。
+
+   Qwen3-4B 在本机跑不起来，是 2080 Ti 显存不够，不是项目本身的限制。但在 4090 上用 8k 上下文、K 个并发采样做 GRPO 会很紧，所以不作为主线。等主线跑完，可以作为"扩大规模"的对比实验再考虑。
+3. **判分假阴性按方案 (c) 处理。** 训练用的奖励不变，仍然要求全部隐藏用例通过。另外在判分结果里，按用例类型分别记录通过情况。评测时同时报告两种口径：严格口径（全部隐藏用例），以及只看 `test` 和 `challenge` 用例的口径。目前测到的假阴性率是 1.5%，而且只在强模型上出现；到阶段 3 策略变强以后再重新评估。
+
+## 1. 规则
+
+- 阶段 1 的规则全部继续有效：
+  - 代码在 WSL 里写；
+  - 每一步做完跑全量测试、提交 git、写 PROGRESS；
+  - 遇到"停下报告"的情况不得自行降低要求；
+  - 每次提交前做密钥检查；
+  - `.env` 的约定照旧（修订 4 第 4 条）。
+- **付费 API 本阶段上限 15 元**，累计花费写进 `runs/deepseek-sft/cost.json`。到上限就停止，按已完成的部分报告。
+- **训练依赖不进主项目。** torch、transformers、peft 装在单独的 `~/.venvs/train` 里，锁定的版本写进仓库的 `requirements-train.txt`。训练代码放在 `src/arl/sft/`，主项目的测试不能 import torch：需要 torch 的测试放在 `tests/train/`，没装 torch 时自动跳过。
+- **不改冻结的题集，也不改环境的行为。** 只允许增加分析用的字段，并且要证明奖励没有变（见第 0 步）。
+
+## 2. 分步计划
+
+### 第 0 步：判分按用例类型分别记录（不改奖励）
+
+- 在 `GradeResult` 里新增 `hidden_by_kind: {kind: [pass, total]}`，`kind` 取 `test`、`challenge`、`generated`；再新增 `pass_non_generated: bool`。奖励的计算方式不变。
+- 新增的字段默认为空，旧的 JSONL 照样能读。
+- 证明奖励没变：拿 `runs/diag/qwen3-1.7b*.jsonl` 里全部 400 个 episode 的最终工作区重新判分（复原方法和 falseneg 一样，重放 `edit_file`），新旧奖励必须逐条相同。有任何一条不同就停下报告。
+- 提交，并打 tag `phase2-grader-v1`。
+
+### 第 1 步：把训练集再分成 SFT 池和 RL 池
+
+原因：如果 SFT 和 GRPO 用同一批题，SFT 模型在这些题上会接近全对，校准后会被大量筛掉，这样筛出来的难度也是有偏的。
+
+- 只在 `train` 内部按**簇**划分（簇的定义和 `clustering` 一致）。固定 seed `sftsplit-0`，打乱簇的顺序，依次放进 SFT 池，直到 SFT 池的 bug 来源函数达到训练集的 40%，其余的簇都归 RL 池。
+- 输出 `data/tasks/train_sft_ids.txt` 和 `train_rl_ids.txt`，每行一个题号。原来的 jsonl 不动，把这两个文件的 sha256 写进新文件 `data/tasks/phase2-split.json`。
+- 写测试：同一个簇不能跨两个池；两个池的并集就是完整的训练集，交集为空；留出集的题不能出现在这两个文件里。
+- 报告两个池各有多少题、多少来源函数、bug 类型怎么分布。
+
+### 第 2 步：用 DeepSeek 采集轨迹（只在 SFT 池上采）
+
+- 环境用 `phase1-env-v1`，模型 `deepseek-flash`，非思考模式，`temperature` 0.8，`max_tokens` 1024。
+- 每题跑 1 次；失败的题再补跑 1 次，每题最多 2 次。
+- 成功轨迹的上限是 1500 条，花费上限 15 元，先到哪个就停。
+- 原始结果写进 `runs/deepseek-sft/episodes.jsonl`，要能断点续跑。
+- **开始前先抽 20 条做试点**，报告解出率和平均每条的花费。如果按这个单价估算，采到 1000 条成功轨迹要超过 12 元，就停下报告。
+
+### 第 3 步：构建 SFT 数据集 `src/arl/sft/data.py`
+
+**筛选**：每条轨迹必须同时满足下面全部条件才保留，否则丢弃，并按原因计数：
+
+- 奖励是 1；
+- 没有格式错误，没有被提醒，没有因为上下文超长被截断；
+- 轮数不超过 8；
+- 只修改了 `pkg/` 下的文件，没有动可见测试；
+- 同一道题最多保留 1 条，同一个来源函数最多保留 3 条。
+
+**渲染**：这一步最关键，训练时的 token 必须和推理时完全一致。
+
+- 用 Qwen3-1.7B 自带的 chat template 渲染，参数 `enable_thinking=False`，tools 用环境实际给模型的那份 schema。
+- 每条 assistant 消息都要写成模型推理时会生成的样子，也就是 hermes 格式的 `<tool_call>{json}</tool_call>`，前面加上模板在非思考模式下插入的空 think 块，具体以模板实际输出为准。
+- DeepSeek 返回的 `tool_calls` 是结构化的，要转换成上面的文本格式。参数 JSON 统一用 `json.dumps(..., ensure_ascii=False)` 序列化。
+- 只在 assistant 生成的 token 上计算 loss，包括结尾的 `<|im_end|>`。system、user 和工具结果全部 mask 掉。
+
+**一致性测试**（必须有）：
+
+- 对每条轨迹的每个 assistant 轮，分别做两件事：
+  - 用模板对它之前的消息 `add_generation_prompt=True` 渲染一次，得到前缀；
+  - 把这一轮的 assistant 文本接在前缀后面。
+
+  两者的 token 序列必须逐个相同。
+- 把这一轮的 assistant 文本交给 vLLM 的 hermes parser 解析，解析出来的工具调用必须和原轨迹一致。
+
+不一致的样本一律丢弃并计数。不一致的超过 2%，就停下报告。
+
+**输出**：
+
+- `data/sft/v1/{train,val}.jsonl`。按来源函数切出 5% 作为验证集，这里的验证集只用来看 loss，和留出集无关。
+- 外加 `stats.json`，记录：样本数、token 长度分布（中位数、p95、最大值）、assistant token 占比、每种丢弃原因的计数、bug 类型分布。
+- `data/sft/` 加入 `.gitignore`，只提交 `stats.json`。
+
+**CHECKPOINT-2A-1**：第 0–3 步做完后**不停下**，但要把阶段性结果写进 PROGRESS：
+- 花费；
+- 成功率；
+- 筛选后剩下多少条；
+- 一致性测试的结果；
+- 随机抽 3 条渲染后的样本，贴出文本，标出 loss mask 的边界。
+
+如果筛选后的样本少于 800 条，就停下报告。
+
+### 第 4 步：本地 SFT 预览 `src/arl/sft/train.py`
+
+目的是在 2080 Ti 上验证整条链路：数据能训、loss 会降、训完的模型确实变好。这一步的结果**不是正式结果**。正式训练在 2B 用 bf16 做，超参数也会在那时重新确定。
+
+- **环境**：在 `~/.venvs/train` 里装 torch（版本要和 WSL 里的 CUDA 驱动匹配）、transformers、peft。版本锁定在 `requirements-train.txt`。不用 TRL、DeepSpeed、bitsandbytes。
+- **配置**（写进 `configs/sft/preview.json`）：
+  - 基座 `Qwen/Qwen3-1.7B`，权重按 fp16 加载；
+  - LoRA：r=16，alpha=32，dropout 0.05，作用在全部 attention 和 MLP 的线性层上；
+  - 适配器参数保持 fp32；前向用 fp16 autocast，配合 GradScaler；
+  - 打开 gradient checkpointing；
+  - `max_seq_len` 8192，样本超长就丢弃，不截断；
+  - micro batch 1，梯度累积 16；
+  - 学习率 1e-4，cosine 调度，warmup 3%；
+  - 训练 2 个 epoch，seed 0。
+- **记录**：每 10 步记一次 train loss、学习率、grad norm，每 100 步记一次 val loss，写进 `runs/sft-preview/log.jsonl`。
+- **每一步都要检查**：loss 和 grad norm 是否出现 NaN 或 inf、GradScaler 的 scale 有没有一路降到 1 以下、显存峰值多少。
+- **停止条件**，满足任何一条就停下报告，不要改成 fp32、改学习率或改 LoRA 配置：
+  - 出现 NaN 或 inf，或者 scale 持续下降；
+  - 显存不够（OOM）；
+  - 估算总训练时间超过 12 小时；
+  - 第一个 epoch 结束时 val loss 没有下降。
+- 训完把适配器合并进基座，按 fp16 保存到 `runs/sft-preview/merged/`。这一目录不入库。
+
+### 第 5 步：本地评测
+
+- **dev 集**：从 RL 池按来源函数分层抽 100 题，固定 seed `dev-0`，题号写进 `data/tasks/dev_ids.txt` 并提交。本阶段做任何决定只看 dev 集。**留出集不跑**，留到阶段 3 正式评测时用一次。
+- **对照**：基座 Qwen3-1.7B 和 SFT 预览模型，两者在 dev 集上各跑 K=4 次，temperature 0.8，环境 `phase1-env-v1`。vLLM 的启动参数和诊断扫描时完全一样，SFT 模型直接加载 `merged/`。
+- **报告**：
+  - 两种口径的解出率（严格口径，以及只看 `test`+`challenge` 的口径）；
+  - 每题 4 次里解出次数的分布（0/1/2/3/4），解出 1–3 次的题占多少；
+  - 格式错误率、被提醒的比例、`edit_file` 成功率；
+  - 平均轮数、停止原因分布；
+  - 按 bug 类型的解出率。
+- **配对比较**：按题计算"SFT 模型的解出率减基座的解出率"，给出均值和按题 bootstrap 的 95% 置信区间（重抽 10000 次，seed 0）。
+- **停止条件**：SFT 预览模型的严格解出率没有高过基座，就停下报告。不要调参数重训。
+
+### 第 6 步：CHECKPOINT-2A
+
+写 `docs/plan/CHECKPOINT-2A.md`，内容包括：
+
+- 第 0–5 步各自的结论；
+- 花费明细；
+- SFT 数据集的统计；
+- 训练曲线（贴关键数值即可，不用画图）；
+- 评测的对比表和配对置信区间；
+- 留给 2B 的事项：
+  - 在 dev 集上，SFT 模型解出 1–3 次的题占多少，用这个比例估算 RL 池全量校准后能剩下多少题；
+  - 预计显存和吞吐量；
+  - 遇到的问题。
+
+## 3. 不要做的事
+
+- 不写 GRPO 或任何 RL 代码，不租服务器。
+- 不在留出集上跑任何东西。
+- 不改冻结的题集、不改环境行为，也不改奖励。
+- 不用 SFT 池以外的题采轨迹，不用失败轨迹训练。
+- 遇到停止条件时，不自行换模型、换精度、改超参数。
