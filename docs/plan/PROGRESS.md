@@ -789,3 +789,109 @@ CHECKPOINT-2A 审计通过。审计修订 2A-2 补在 `PHASE-2-SFT.zh-CN.md` 末
 测试结果：
 - `uv run pytest -q` → 260 passed，3 skipped；
 - `~/.venvs/vllm` 全量 → 265 passed，1 skipped。
+
+## 第 2 步：试点（修订 2C-1 第 4 条）——触发停止条件，停下
+
+### 做法
+
+- **脚本** `scripts/calibrate_rl.sh pilot|full`：
+  - 用诊断扫描的参数起 vLLM，加载 fp16 的 `runs/sft-preview/merged`；
+  - 在 `~/.venvs/vllm` 里跑 token 客户端，客户端配置 `configs/grpo/calibrate-v1.json`（T=1.0、top_p 1.0、top_k 0），K=4；
+  - 记录写到 `runs/grpo-calib/rl-train.jsonl`。
+- **试点** 用 `--ids data/tasks/rl_train_ids.txt --sample 50`，按 bug 来源函数轮流抽，种子 0：50 题、50 个函数，200 个 episode，报错 0，逐轮 `/tokenize` 比对 0 处不一致。
+- **全量** 用同一个记录文件续跑，试点的 50 题不重跑。全量还没开始。
+- **fp16 和 bf16 的差别**：本地校准用的是 fp16 合并模型，服务器上 GRPO 的起点是 bf16 基座加 SFT-v1 适配器，两者数值上略有不同。服务器上由 `merge_bf16.sh` 在 dev 集上核对。
+
+### 结果（`runs/grpo-calib/pilot-report.json`）
+
+| | 试点：rl_train 50 题，T=1.0，top_k 0 | dev 100 题，T=0.8，top_k 20（新客户端） |
+| --- | --- | --- |
+| 严格解出率 | 38.5% | 55.25% |
+| 只看 test 和 challenge | 44.0% | 59.5% |
+| **出现格式错误的 episode** | **18.0%**（36 / 200） | 5.5%（22 / 400） |
+| 每次工具调用的格式错误率 | 3.45% | 1.72% |
+| 解出 1–3 次的题 | 38%（19 / 50） | 41% |
+| 解出 0/1/2/3/4 次的题数 | 21 / 4 / 12 / 3 / 10 | 25 / 15 / 8 / 18 / 34 |
+| 平均轮数 | 7.05 | 6.47 |
+| 用满 10 轮 | 35% | 24% |
+| 被提醒过 | 10% | 4.25% |
+| 每个 episode 的输出 token（均值 / p99 / 最大） | 612 / 2781 / 2970 | 508 / 2158 / 3343 |
+
+- **停止条件**：
+  - 出现格式错误的 episode 是 18.0%，超过 15%，**触发**；
+  - 严格解出率 38.5%，不低于 30%，没触发。
+- **按要求停下**：
+  - 没有跑全量校准；
+  - 没有改温度或 top_k；
+  - 没有打 tag `grpo-tasks-v1`；
+  - 没有在 GPU 上跑第 3 步的任何东西（包括 sleep mode 探测）。
+- **格式错误的构成**：
+  - 试点：`invalid_arguments` 26 次、`malformed_call` 17 次、`unknown_tool` 2 次；
+  - dev：`invalid_arguments` 23 次、`malformed_call` 17 次。
+  - 试点有错的 36 个 episode 里，29 个只错 1 次，5 个错 2 次，2 个错 3 次，其中只有 3 个最后解出。
+- **不确定性**：
+  - 按题做 bootstrap（重抽 10000 次，种子 0），格式错误 episode 比例的 95% 区间是 [12.5%, 24.0%]。区间跨过了 15%，但点估计在 15% 以上。
+  - 50 题里有 25 题至少出过一次格式错误。
+- **对比口径**：两组的题集不同（rl_train 抽样对 dev），T 和 top_k 也都不同，所以表里的差别不全是采样参数造成的。
+
+## 第 3 步的代码（未在 GPU 上运行）
+
+试点期间按要求并行写了不占 GPU 的部分，和测试一起提交。
+
+### 文件（`src/arl/rl/`）
+
+- `config.py`：读配置，支持 `base` 加 `overrides`，并做检查。下面任何一条不满足就拒绝启动：
+  - 客户端是 token 接口，(temperature, top_p, top_k) 是 (1.0, 1.0, 0)；
+  - LoRA dropout 是 0；
+  - β 是 0；
+  - `memory_mode` 是 sleep、restart、colocate 之一。
+- `batch.py`：
+  - 优势 `A_i = r_i - mean(r)`，全对或全错的组跳过并计数；
+  - 每一轮单独作为一条训练序列，就是 `prompt_ids + completion_ids` 原样拼接，loss 只算 completion 部分；
+  - `T_norm = n_tasks · G · max_completion_tokens_per_episode`。
+  - 轮与轮不能拼成一条：Qwen3 模板渲染历史助手轮时去掉了空 think 块，下一轮的 prompt 不是上一轮序列的延续。
+- `rollout.py`：每题 G 条 episode，种子由 (seed, step, 题号, 序号) 决定。
+- `loss.py`：
+  - 只为 completion 位置计算 logits；
+  - TIS 权重 `min(exp(logp_train - logp_vllm), 2)`，不参与求导；
+  - 记录 k3 KL、logprob 差异的均值、p99、最大值，以及被截断的比例；
+  - 每批只做 1 次优化器更新。
+- `trainer.py`：
+  - 在基座上加 SFT-v1 的 LoRA 继续训，另加一个冻结的 `ref` 适配器用来算 KL。
+  - sleep 和 restart 模式下，每步训练前把模型建到 GPU 上，训练后释放显存；LoRA 权重、优化器状态、GradScaler 状态留在 CPU。
+  - LoRA dropout 设为 0（SFT 时是 0.05），否则训练端的 logp 和采样端对不上。
+- `vllm_server.py`：
+  - 管理 vLLM 的启停、sleep 和 wake up、运行时 LoRA 加载、贪心生成和 prompt logprob；
+  - 带一个 `probe` 子命令，用来探测 sleep mode 能不能用。
+- `grpo.py`：训练主循环。每一步依次是：
+  1. 采样；
+  2. 让出显存给训练端；
+  3. 训练；
+  4. 保存适配器，用新名字；
+  5. 把显存还给 vLLM，热加载新适配器；
+  6. 两项同步检查：固定 prompt 的贪心输出一致；本步一条序列上的 logprob 平均绝对差不超过 0.05。
+
+  主循环还负责停止条件、dev 评测、断点续跑，以及过拟合测试训练前后的测量。
+- `taskset.py`：由校准记录生成 `grpo_v1_ids.txt` 和 `grpo_v1.json`；保留的题少于 400 道时什么都不写，退出码 4。
+- 配置：`configs/grpo/v1.json`，以及过拟合测试用的 `configs/grpo/overfit-local.json`。
+
+### 本地显存调度的计划（还没验证）
+
+- 本机内存 9.7 GiB，vLLM 运行时两个进程加起来约 3.5 GiB。
+- sleep level 1 要把 3.4 GiB 权重卸到内存，加上训练端很可能放不下，所以本地默认用 level 2：丢掉权重，wake up 后通过 `POST /collective_rpc {"method": "reload_weights"}` 从磁盘重新加载。
+- 这是 vLLM 0.31 源码里 `gpu_worker.sleep / wake_up` 和 dev 路由 `/collective_rpc` 的用法。
+
+### 依赖和测试
+
+- 没有新增依赖：safetensors 已经随 transformers 和 peft 装在 `~/.venvs/train` 里。
+- 测试（`tests/rl/`）：
+  - 不依赖 torch：优势的三种组、多轮轨迹的 loss mask、训练序列不重新渲染、`T_norm`、配置检查（采样参数不是 (1.0, 1.0, 0) 就拒绝）、任务调度、rollout、题集生成；
+  - 依赖 torch（CPU）：completion logp、loss 和 TIS 的数值与梯度、k3、优势为 0 时不更新；
+  - 玩具测试：随机初始化的小 Qwen3，平均奖励在 50 步内从约 1/16 升到 0.8 以上；
+  - `PolicyTrainer` 用小模型测：两个适配器都正确加载、只训练 `default`、释放后重建能继续训得完全一样、保存的适配器格式和 SFT-v1 相同。
+- **还没做**：sleep mode 探测、过拟合测试，以及第 4–6 步。
+
+测试结果：
+- `uv run pytest -q` → 277 passed，5 skipped；
+- `~/.venvs/vllm` 全量 → 287 passed，2 skipped；
+- `~/.venvs/train` 里跑 `tests/train`、`tests/rl`、`tests/test_tokenclient.py`、`tests/test_hermes.py` → 52 passed，3 skipped。

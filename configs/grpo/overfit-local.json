@@ -1,0 +1,13 @@
+{
+  "base": "configs/grpo/v1.json",
+  "overrides": {
+    "task_sample": 8,
+    "task_sample_seed": 0,
+    "n_tasks": 8,
+    "group_size": 8,
+    "steps": 30,
+    "eval": {"every": 0},
+    "measure": {"k": 8},
+    "out_dir": "runs/grpo-overfit"
+  }
+}
