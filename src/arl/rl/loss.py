@@ -17,18 +17,48 @@ from arl.rl.batch import Sequence
 from arl.rl.config import Stop
 
 
+# Rows of the vocab projection handled at once. A full fp32 logit matrix is n × vocab; chunking keeps
+# that matrix, its cross-entropy gradient, and the entropy intermediates to one chunk.
+CHUNK_ROWS = 256
+
+
+def _body_and_head(model: Any) -> tuple[Any, Any]:
+    """Transformer body and ``lm_head``. LoRA, when present, already lives inside the body modules."""
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    return base.model, base.lm_head
+
+
+def _completion_hidden(model: Any, input_ids: list[int], start: int, device: str | torch.device):
+    """Hidden states that predict ``input_ids[start:]``, and those target ids."""
+    ids = torch.tensor([input_ids], device=device)
+    n = len(input_ids) - start
+    body, head = _body_and_head(model)
+    hidden = body(input_ids=ids, use_cache=False).last_hidden_state[0, -(n + 1):-1]
+    return head, hidden, ids[0, start:]
+
+
 def completion_logits(model: Any, input_ids: list[int], start: int, device: str | torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    """Logits at completion positions, and the token ids those logits predict."""
+    """Full fp32 logits at completion positions. The training step does not use this; tests do."""
     ids = torch.tensor([input_ids], device=device)
     n = len(input_ids) - start
     logits = model(input_ids=ids, logits_to_keep=n + 1, use_cache=False).logits[0, :-1].float()
     return logits, ids[0, start:]
 
 
-def completion_logps(model: Any, input_ids: list[int], start: int, device: str | torch.device) -> torch.Tensor:
-    """Log-probabilities of ``input_ids[start:]``; logits are computed for those positions only."""
-    logits, targets = completion_logits(model, input_ids, start, device)
-    return -F.cross_entropy(logits, targets, reduction="none")
+def _chunked_logps(head: Any, hidden: torch.Tensor, targets: torch.Tensor, chunk_rows: int) -> torch.Tensor:
+    parts = []
+    for row in range(0, hidden.shape[0], chunk_rows):
+        logits = head(hidden[row:row + chunk_rows]).float()
+        parts.append(-F.cross_entropy(logits, targets[row:row + chunk_rows], reduction="none"))
+        del logits
+    return torch.cat(parts)
+
+
+def completion_logps(model: Any, input_ids: list[int], start: int, device: str | torch.device,
+                     chunk_rows: int = CHUNK_ROWS) -> torch.Tensor:
+    """Log-probabilities of ``input_ids[start:]``. The vocab projection is applied in row chunks."""
+    head, hidden, targets = _completion_hidden(model, input_ids, start, device)
+    return _chunked_logps(head, hidden, targets, chunk_rows)
 
 
 def token_entropy(logits: torch.Tensor) -> torch.Tensor:
@@ -65,8 +95,12 @@ def train_step(model: Any, params: list[torch.nn.Parameter], opt: torch.optim.Op
                seqs: list[Sequence], t_norm: float, *, tis_cap: float | None, max_grad_norm: float,
                device: str | torch.device, amp_dtype: torch.dtype | None = None,
                ref_logps: Callable[[Sequence], torch.Tensor] | None = None,
-               kl_max_sequences: int | None = None) -> dict[str, Any]:
-    """One optimizer update on all ``seqs`` (gradients accumulated sequence by sequence)."""
+               kl_max_sequences: int | None = None, chunk_rows: int = CHUNK_ROWS) -> dict[str, Any]:
+    """One optimizer update on all ``seqs`` (gradients accumulated sequence by sequence).
+
+    Log-probabilities come from a chunked vocab projection. Each chunk is backwarded before the next is
+    built, and the entropy of that chunk is computed only after that backward, on detached logits.
+    """
     amp = (torch.autocast(device_type="cuda", dtype=amp_dtype) if amp_dtype is not None and str(device).startswith("cuda")
            else contextlib.nullcontext())
     model.train()
@@ -75,21 +109,30 @@ def train_step(model: Any, params: list[torch.nn.Parameter], opt: torch.optim.Op
     kl_n = len(seqs) if kl_max_sequences is None else min(len(seqs), kl_max_sequences)
     for i, s in enumerate(seqs):
         with amp:
-            logits, targets = completion_logits(model, s.input_ids, s.start, device)
-            logp = -F.cross_entropy(logits, targets, reduction="none")
-        with torch.no_grad():
-            ents.append(token_entropy(logits.detach()))
-        vllm_logp = torch.tensor(s.vllm_logprobs, device=logp.device, dtype=logp.dtype)
-        loss, diff, c = policy_loss(logp, vllm_logp, s.advantage, t_norm, tis_cap)
-        if not torch.isfinite(loss):
-            raise Stop(f"non-finite loss on sequence {i} (episode {s.episode}, turn {s.turn})")
-        scaler.scale(loss).backward()
-        loss_sum += float(loss.detach())
-        diffs.append(diff)
-        capped += c
-        tokens += len(diff)
-        if i < kl_n:
-            kept.append(logp.detach())
+            head, hidden, targets = _completion_hidden(model, s.input_ids, s.start, device)
+        vllm_logp = torch.tensor(s.vllm_logprobs, device=hidden.device)
+        seq_logp = []
+        n = hidden.shape[0]
+        for row in range(0, n, chunk_rows):
+            with amp:
+                logits = head(hidden[row:row + chunk_rows]).float()
+                logp = -F.cross_entropy(logits, targets[row:row + chunk_rows], reduction="none")
+            piece, diff, c = policy_loss(logp, vllm_logp[row:row + chunk_rows].to(dtype=logp.dtype),
+                                         s.advantage, t_norm, tis_cap)
+            if not torch.isfinite(piece):
+                raise Stop(f"non-finite loss on sequence {i} (episode {s.episode}, turn {s.turn})")
+            last = row + chunk_rows >= n
+            scaler.scale(piece).backward(retain_graph=not last)
+            with torch.no_grad():
+                ents.append(token_entropy(logits.detach()))
+            seq_logp.append(logp.detach())
+            loss_sum += float(piece.detach())
+            diffs.append(diff)
+            capped += c
+            tokens += len(diff)
+            del logits, logp, piece
+        if i < kl_n and seq_logp:
+            kept.append(torch.cat(seq_logp))
     stats: dict[str, Any] = {"sequences": len(seqs), "loss_tokens": tokens, "loss": loss_sum}
     if diffs:
         d = torch.cat(diffs).abs()

@@ -945,6 +945,14 @@ CHECKPOINT-2A 审计通过。审计修订 2A-2 补在 `PHASE-2-SFT.zh-CN.md` 末
 
 这一条序列的旧路径反向峰值是 8.165 GiB，自己放得进 10 GiB。上次整步 OOM 是批里更长的 prompt 加上整块 logits 的反向，不是这一条单独放不下。
 
+## 修订 2C-3 第 4 条：分块 logp 和熵
+
+- `train_step` 不再把整段 completion 的 fp32 logits 留在图里。骨干只出 hidden state，`lm_head` 按 256 行一块做，每块立刻 `backward`，熵在该块反向之后用 detach 的 logits 算。`completion_logps` 同样分块，给参考模型和同步检查用。上下文长度、`max_turns`、LoRA、`cuda_memory_limit_gib` 都没改，也没有丢弃或截断序列。
+- CPU 小模型测试 `test_chunked_step_matches_full_logits_loss_grad_and_entropy`：loss、每个参数的梯度、熵，和整块 logits 的旧实现相差都在 1e-5 以内。分块大小在测试里设成 4，让一条序列跨多块。
+- 同一条 2553+1024 的序列，新路径峰值 **7.40 GiB**（旧路径反向峰值 8.165）。两边的熵都是 0.5456380248069763。
+- 过拟合配置的 `memory_mode` 改回 `sleep`，先按修订重跑；放不下再改 restart。
+- 测试：train 环境 59 passed、3 skipped；uv 282 passed、6 skipped；vLLM 环境 295 passed、2 skipped。
+
 ## 第 3 步的代码（未在 GPU 上运行）
 
 试点期间按要求并行写了不占 GPU 的部分，和测试一起提交。

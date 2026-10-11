@@ -8,7 +8,7 @@ torch = pytest.importorskip("torch")
 transformers = pytest.importorskip("transformers")
 
 from arl.rl.batch import Episode, Sequence, Turn, sequences, t_norm  # noqa: E402
-from arl.rl.loss import completion_logps, k3, policy_loss, token_entropy, train_step  # noqa: E402
+from arl.rl.loss import completion_logits, completion_logps, k3, policy_loss, token_entropy, train_step  # noqa: E402
 
 
 def tiny_model(vocab=16, seed=0):
@@ -76,6 +76,56 @@ def test_zero_advantage_gives_no_update():
     stats = train_step(model, params, opt, torch.amp.GradScaler("cpu", enabled=False), [s], 8.0, tis_cap=2.0,
                        max_grad_norm=1.0, device="cpu")
     assert stats["grad_norm"] == 0.0 and all(torch.equal(a, b) for a, b in zip(before, params))
+
+
+def _full_logits_step(model, params, opt, scaler, seqs, t_norm, tis_cap, max_grad_norm, device):
+    """The pre-change step: one fp32 logit matrix per sequence, entropy before backward."""
+    model.train()
+    opt.zero_grad(set_to_none=True)
+    loss_sum, ents = 0.0, []
+    for s in seqs:
+        logits, targets = completion_logits(model, s.input_ids, s.start, device)
+        logp = -torch.nn.functional.cross_entropy(logits, targets, reduction="none")
+        with torch.no_grad():
+            ents.append(token_entropy(logits.detach()))
+        vllm = torch.tensor(s.vllm_logprobs, device=logp.device, dtype=logp.dtype)
+        loss, _, _ = policy_loss(logp, vllm, s.advantage, t_norm, tis_cap)
+        scaler.scale(loss).backward()
+        loss_sum += float(loss.detach())
+    torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
+    grads = [(p.grad.detach().clone() if p.grad is not None else None) for p in params]
+    return loss_sum, torch.cat(ents), grads
+
+
+def test_chunked_step_matches_full_logits_loss_grad_and_entropy():
+    """Row-chunked logp and entropy stay within 1e-5 of the full-vocab implementation."""
+    model = tiny_model(vocab=24, seed=1)
+    params = [p for p in model.parameters() if p.requires_grad]
+    ids = list(range(1, 20))
+    seqs = [Sequence(ids, 8, [-0.4] * 11, 0.5, 0, 0), Sequence(ids[::-1], 8, [-0.7] * 11, -0.25, 1, 1)]
+    scaler = torch.amp.GradScaler("cpu", enabled=False)
+    opt_old = torch.optim.AdamW(params, lr=0.0, weight_decay=0.0)
+    loss_old, ent_old, grads_old = _full_logits_step(model, params, opt_old, scaler, seqs, 32.0, 2.0, 1e9, "cpu")
+    opt_old.zero_grad(set_to_none=True)
+    opt_new = torch.optim.AdamW(params, lr=0.0, weight_decay=0.0)
+    saved = {}
+
+    def grab_grads():
+        saved["grads"] = [(p.grad.detach().clone() if p.grad is not None else None) for p in params]
+
+    opt_new.step = grab_grads
+    stats = train_step(model, params, opt_new, scaler, seqs, 32.0, tis_cap=2.0, max_grad_norm=1e9,
+                       device="cpu", chunk_rows=4)
+    assert stats["loss"] == pytest.approx(loss_old, abs=1e-5)
+    assert stats["completion_entropy_mean"] == pytest.approx(float(ent_old.mean()), abs=1e-5)
+    assert saved["grads"] and len(saved["grads"]) == len(grads_old)
+    for new, old in zip(saved["grads"], grads_old):
+        assert old is not None and new is not None
+        assert torch.allclose(new, old, atol=1e-5, rtol=1e-5)
+    got = completion_logps(model, ids, 8, "cpu", chunk_rows=4)
+    full, _ = completion_logits(model, ids, 8, "cpu")
+    want = -torch.nn.functional.cross_entropy(full, torch.tensor(ids[8:]), reduction="none")
+    assert torch.allclose(got, want, atol=1e-5)
 
 
 def test_toy_policy_learns_to_emit_the_rewarded_token():
