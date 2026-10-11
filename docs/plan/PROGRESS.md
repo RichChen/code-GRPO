@@ -762,3 +762,14 @@ CHECKPOINT-2A 审计通过。审计修订 2A-2 补在 `PHASE-2-SFT.zh-CN.md` 末
 - `uv run pytest -q` → 257 passed，3 skipped；
 - `~/.venvs/vllm` 全量 → 262 passed，1 skipped；
 - `~/.venvs/train` 里跑 `tests/train`、`tests/test_tokenclient.py`、`tests/test_hermes.py` → 26 passed，3 skipped。
+
+## 审计修订 2C-1：第 1 步按新判定通过
+
+- 修订 2C-1 原样补在 `PHASE-2C-LOCAL-PREP.zh-CN.md` 第 0 节末尾。
+- 贪心比对的硬性判定换成回放比对：
+  - 结果是 64 / 65 = 98.5%，不低于 95%；
+  - 唯一不一致的一轮重发后复现不出来，属于数值上的非确定性；
+  - 没有渲染或解析造成的不一致。
+- 所以第 1 步通过。
+- 整条轨迹的贪心比对改为参考指标：新客户端对旧客户端 7 / 10，旧客户端对自己 7 / 10。
+- 环境保持 `phase1-env-v1` 不变。
