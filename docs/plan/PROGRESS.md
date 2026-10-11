@@ -953,6 +953,21 @@ CHECKPOINT-2A 审计通过。审计修订 2A-2 补在 `PHASE-2-SFT.zh-CN.md` 末
 - 过拟合配置的 `memory_mode` 改回 `sleep`，先按修订重跑；放不下再改 restart。
 - 测试：train 环境 59 passed、3 skipped；uv 282 passed、6 skipped；vLLM 环境 295 passed、2 skipped。
 
+## 修订 2C-3 第 5 条：没有可用的 cu128 / cu126 备用环境
+
+查的是 PyPI 和官方下载页（2026-10-12），没有准备 `~/.venvs/vllm-cu128`，也没有改 `setup.sh` 的安装分支。
+
+- **torch 2.13.0**
+  - PyPI `https://pypi.org/pypi/torch/2.13.0/json` 的 Linux x86_64 wheel 是 `torch-2.13.0-cp312-cp312-manylinux_2_28_x86_64.whl`，文件名里没有 cu128 或 cu126。本仓库的 `requirements-train.txt` 用的就是这份，注释写明它是 CUDA 13.0 构建。
+  - `https://download.pytorch.org/whl/cu126/torch/` 有 `torch-2.13.0+cu126-cp312-cp312-manylinux_2_28_x86_64.whl`。
+  - `https://download.pytorch.org/whl/cu130/torch/` 有 `torch-2.13.0+cu130-cp312-cp312-manylinux_2_28_x86_64.whl`。
+  - `https://download.pytorch.org/whl/cu128/torch/` 和 `cu124` 的索引里没有 torch 2.13.0。
+- **vLLM 0.31.0**
+  - PyPI `https://pypi.org/pypi/vllm/0.31.0/json` 只有 `vllm-0.31.0-cp38-abi3-manylinux_2_28_{x86_64,aarch64}.whl` 和源码包。依赖是 `torch==2.13.0` 和 `nvidia-cutlass-dsl[cu13]==4.7.1`，这是 CUDA 13 的构建，不是 cu128 / cu126。
+  - GitHub Release `https://github.com/vllm-project/vllm/releases/tag/v0.31.0` 的附件是 cpu、xpu、`vllm-0.31.0+cu129`，以及和 PyPI 同名的那份 wheel。没有 cu128，也没有 cu126。
+- cu129 不是修订要求的 cu128 或 cu126，而且驱动只到 CUDA 12.8 时跑不了 cu129，535 / 550 更跑不了。torch 虽有官方 cu126 wheel，vLLM 0.31.0 没有对应的官方 wheel，配不成一套备用环境。
+- 因此停止准备备用环境。`scripts/server/sync.md` 写明：租机时必须选驱动 580 以上的镜像。`setup.sh` 仍然是驱动 CUDA 低于 13.0 就停下。
+
 ## 第 3 步的代码（未在 GPU 上运行）
 
 试点期间按要求并行写了不占 GPU 的部分，和测试一起提交。

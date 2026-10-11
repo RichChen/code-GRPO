@@ -2,6 +2,8 @@
 
 在 4090 上跑 `scripts/server/setup.sh`，仓库用 git 拿。下面这些不在 git 里，要单独传。
 
+**租机时必须选驱动 580 以上的镜像**（`nvidia-smi` 里的 CUDA Version 至少 13.0）。torch 2.13.0 和 vLLM 0.31.0 没有能在 CUDA 12.8 或 12.6 上用的官方组合，`setup.sh` 遇到更低的驱动会停下。详见 PROGRESS 里修订 2C-3 第 5 条。
+
 ## 传到服务器
 
 - `runs/sft-v1/adapter/`：SFT-v1 的 fp32 LoRA。服务器上用 `merge_fp16.sh` 把它合并进以 fp16 加载的原始基座。
