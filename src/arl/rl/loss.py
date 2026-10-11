@@ -17,12 +17,24 @@ from arl.rl.batch import Sequence
 from arl.rl.config import Stop
 
 
-def completion_logps(model: Any, input_ids: list[int], start: int, device: str | torch.device) -> torch.Tensor:
-    """Log-probabilities of ``input_ids[start:]``; logits are computed for those positions only."""
+def completion_logits(model: Any, input_ids: list[int], start: int, device: str | torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """Logits at completion positions, and the token ids those logits predict."""
     ids = torch.tensor([input_ids], device=device)
     n = len(input_ids) - start
     logits = model(input_ids=ids, logits_to_keep=n + 1, use_cache=False).logits[0, :-1].float()
-    return -F.cross_entropy(logits, ids[0, start:], reduction="none")
+    return logits, ids[0, start:]
+
+
+def completion_logps(model: Any, input_ids: list[int], start: int, device: str | torch.device) -> torch.Tensor:
+    """Log-probabilities of ``input_ids[start:]``; logits are computed for those positions only."""
+    logits, targets = completion_logits(model, input_ids, start, device)
+    return -F.cross_entropy(logits, targets, reduction="none")
+
+
+def token_entropy(logits: torch.Tensor) -> torch.Tensor:
+    """Shannon entropy (nats) of each row. Callers that must keep it out of the graph pass detached logits."""
+    logp = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+    return -(logp.exp() * logp).sum(dim=-1)
 
 
 def policy_loss(logp: torch.Tensor, vllm_logp: torch.Tensor, advantage: float, t_norm: float,
@@ -59,11 +71,14 @@ def train_step(model: Any, params: list[torch.nn.Parameter], opt: torch.optim.Op
            else contextlib.nullcontext())
     model.train()
     opt.zero_grad(set_to_none=True)
-    diffs, kept, loss_sum, capped, tokens = [], [], 0.0, 0, 0
+    diffs, kept, ents, loss_sum, capped, tokens = [], [], [], 0.0, 0, 0
     kl_n = len(seqs) if kl_max_sequences is None else min(len(seqs), kl_max_sequences)
     for i, s in enumerate(seqs):
         with amp:
-            logp = completion_logps(model, s.input_ids, s.start, device)
+            logits, targets = completion_logits(model, s.input_ids, s.start, device)
+            logp = -F.cross_entropy(logits, targets, reduction="none")
+        with torch.no_grad():
+            ents.append(token_entropy(logits.detach()))
         vllm_logp = torch.tensor(s.vllm_logprobs, device=logp.device, dtype=logp.dtype)
         loss, diff, c = policy_loss(logp, vllm_logp, s.advantage, t_norm, tis_cap)
         if not torch.isfinite(loss):
@@ -80,6 +95,8 @@ def train_step(model: Any, params: list[torch.nn.Parameter], opt: torch.optim.Op
         d = torch.cat(diffs).abs()
         stats.update(logprob_diff_mean=float(d.mean()), logprob_diff_p99=quantile(d, 0.99),
                      logprob_diff_max=float(d.max()), tis_capped_fraction=capped / tokens if tis_cap else None)
+    if ents:
+        stats["completion_entropy_mean"] = float(torch.cat(ents).mean())
     if ref_logps is not None and kept:
         with torch.no_grad():
             kl = torch.cat([k3(lp, ref_logps(s).to(lp)) for lp, s in zip(kept, seqs)])

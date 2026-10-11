@@ -4,14 +4,15 @@ from arl.env.task import Task
 from arl.rl.taskset import build
 
 
-def write(tmp_path, base_task, solved_counts):
+def write(tmp_path, base_task, solved_counts, format_errors=0, n_tool_calls=10):
     tasks, recs = [], []
     for i, (tid, solved) in enumerate(solved_counts.items()):
         meta = dict(base_task.meta, bug_source=f"mbpp/f{i % 2}", bug_type=["arith_swap", "var_swap"][i % 2])
         tasks.append(Task.from_dict({**base_task.to_dict(), "task_id": tid, "meta": meta}))
         for k in range(4):
             recs.append({"task_id": tid, "k": k, "reward": int(k < solved), "grade": {"pass_non_generated": k < solved},
-                         "stop_reason": "submitted" if k < 3 else "max_turns", "turns": 3, "format_errors": 0,
+                         "stop_reason": "submitted" if k < 3 else "max_turns", "turns": 3,
+                         "format_errors": format_errors, "n_tool_calls": n_tool_calls,
                          "nudged": False, "turn_prompt_tokens": [100, 200, 300], "turn_completion_tokens": [10, 20, 30],
                          "finish_reasons": {"stop": 3}})
     recs.append({"task_id": "a", "k": 0, "error": "boom"})  # an errored attempt that was retried earlier
@@ -42,3 +43,12 @@ def test_stops_below_the_minimum_without_writing(tmp_path, task):
     write(tmp_path, task, {"a": 0, "b": 1, "c": 4})
     s = run(tmp_path, min_tasks=400)
     assert "stop" in s and not (tmp_path / "out.txt").exists() and not (tmp_path / "out.json").exists()
+
+
+def test_per_call_format_error_rate_stops_above_6_percent_and_keeps_exactly_6(tmp_path, task):
+    write(tmp_path, task, {"a": 0, "b": 1, "c": 2, "d": 3, "e": 4, "f": 2}, format_errors=3, n_tool_calls=50)
+    kept = run(tmp_path, min_tasks=2)
+    assert "stop" not in kept and kept["calibration"]["format_error_rate_per_tool_call"] == 0.06
+    write(tmp_path, task, {"a": 0, "b": 1, "c": 2, "d": 3, "e": 4, "f": 2}, format_errors=1, n_tool_calls=10)
+    stopped = run(tmp_path, min_tasks=2)
+    assert "format-error" in stopped["stop"] and not (tmp_path / "out.txt").exists()

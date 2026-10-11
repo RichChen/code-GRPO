@@ -30,6 +30,7 @@ class Episode:
     turns: list[Turn]
     stop_reason: str = ""
     format_errors: int = 0
+    tool_calls: int = 0
     nudged: bool = False
     meta: dict[str, Any] = field(default_factory=dict)
 
@@ -92,6 +93,9 @@ def t_norm(n_tasks: int, group_size: int, max_completion_tokens_per_episode: int
 def batch_stats(episodes: list[Episode]) -> dict[str, Any]:
     rewards = [e.reward for e in episodes]
     comp = [sum(len(t.completion_ids) for t in e.turns) for e in episodes]
+    calls = sum(e.tool_calls for e in episodes)
+    format_errors = sum(e.format_errors for e in episodes)
+    with_error = sum(1 for e in episodes if e.format_errors)
     return {
         "episodes": len(episodes),
         "reward_mean": round(statistics.fmean(rewards), 4) if rewards else None,
@@ -101,6 +105,9 @@ def batch_stats(episodes: list[Episode]) -> dict[str, Any]:
         "sequence_tokens": sum(len(t.prompt_ids) + len(t.completion_ids) for e in episodes for t in e.turns),
         "stop_reasons": dict(Counter(e.stop_reason for e in episodes)),
         "finish_reasons": dict(Counter(t.finish_reason for e in episodes for t in e.turns)),
-        "episodes_with_format_error": sum(1 for e in episodes if e.format_errors),
+        "episodes_with_format_error": with_error,
+        "episodes_with_format_error_fraction": round(with_error / len(episodes), 4) if episodes else None,
+        "format_error_rate_per_tool_call": round(format_errors / calls, 4) if calls else None,
+        "tool_calls": calls,
         "nudged": sum(1 for e in episodes if e.nudged),
     }

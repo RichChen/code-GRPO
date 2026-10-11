@@ -35,7 +35,7 @@ def collect(tasks: list[Task], group_size: int, config: ClientConfig, model: str
         result = run_episode(task, policy, max_turns)
         return Episode(task_id=task.task_id, group=gi, index=k, reward=float(result.reward),
                        turns=[turn_from_record(t) for t in policy.turns], stop_reason=result.stop_reason,
-                       format_errors=result.format_errors, nudged=result.nudged,
+                       format_errors=result.format_errors, tool_calls=len(result.tool_calls), nudged=result.nudged,
                        meta={"duration_s": round(result.duration_s, 2), "pass_non_generated":
                              bool(result.grade.get("pass_non_generated"))})
 

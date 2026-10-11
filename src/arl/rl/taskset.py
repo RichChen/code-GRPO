@@ -3,7 +3,8 @@
     uv run python -m arl.rl.taskset --records runs/grpo-calib/rl-train.jsonl
 
 Writes ``data/tasks/grpo_v1_ids.txt`` and ``data/tasks/grpo_v1.json`` and prints the calibration report.
-Exits with status 4 (and writes nothing) when fewer than ``--min-tasks`` tasks are kept.
+Exits with status 4 (and writes nothing) when fewer than ``--min-tasks`` tasks are kept, or when the
+per-call format-error rate is above ``--max-format-error-rate`` (6%). Exactly 6% is kept.
 """
 from __future__ import annotations
 
@@ -21,6 +22,14 @@ from arl.env.task import load_tasks
 from arl.rollout.calibrate import latest, load_records
 
 MIN_TASKS = 400
+MAX_FORMAT_ERROR_RATE = 0.06
+
+
+def _per_call_format_error_rate(recs: list[dict[str, Any]]) -> float | None:
+    calls = sum(r.get("n_tool_calls", 0) for r in recs)
+    if not calls:
+        return None
+    return round(sum(r.get("format_errors", 0) for r in recs) / calls, 4)
 
 
 def dist(xs: list[int]) -> dict[str, Any]:
@@ -51,6 +60,7 @@ def report(recs: list[dict[str, Any]], ids: list[str], k: int) -> tuple[dict[str
         "stop_reasons": dict(Counter(r["stop_reason"] for r in recs)),
         "max_turns_fraction": round(sum(1 for r in recs if r["stop_reason"] == "max_turns") / len(recs), 4),
         "episodes_with_format_error": round(sum(1 for r in recs if r.get("format_errors", 0) > 0) / len(recs), 4),
+        "format_error_rate_per_tool_call": _per_call_format_error_rate(recs),
         "turns_mean": round(statistics.fmean(r["turns"] for r in recs), 3),
         "nudged_fraction": round(sum(1 for r in recs if r.get("nudged")) / len(recs), 4),
         "tokens_per_episode": {
@@ -67,7 +77,7 @@ def report(recs: list[dict[str, Any]], ids: list[str], k: int) -> tuple[dict[str
 
 
 def build(records: Path, ids_file: Path, tasks_file: Path, out_ids: Path, out_json: Path, k: int = 4,
-          min_tasks: int = MIN_TASKS) -> dict[str, Any]:
+          min_tasks: int = MIN_TASKS, max_format_error_rate: float = MAX_FORMAT_ERROR_RATE) -> dict[str, Any]:
     ids = sorted(line.strip() for line in ids_file.read_text(encoding="utf-8").splitlines() if line.strip())
     wanted = set(ids)
     recs = [r for r in latest(load_records(records)).values() if r["task_id"] in wanted]
@@ -88,8 +98,16 @@ def build(records: Path, ids_file: Path, tasks_file: Path, out_ids: Path, out_js
         "solve_count_distribution": rep["solve_count_distribution"],
         "calibration": rep,
     }
+    reasons = []
+    rate = rep["format_error_rate_per_tool_call"]
+    if rate is not None and rate > max_format_error_rate:
+        reasons.append(f"per-call format-error rate {rate} > {max_format_error_rate}")
     if len(kept) < min_tasks:
-        summary["stop"] = f"only {len(kept)} tasks kept (< {min_tasks})"
+        reasons.append(f"only {len(kept)} tasks kept (< {min_tasks})")
+    if reasons:
+        summary["stop"] = "; ".join(reasons)
+        out_ids.unlink(missing_ok=True)
+        out_json.unlink(missing_ok=True)
         return summary
     out_ids.write_text(text, encoding="utf-8")
     out_json.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -105,8 +123,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out-json", type=Path, default=Path("data/tasks/grpo_v1.json"))
     ap.add_argument("--k", type=int, default=4)
     ap.add_argument("--min-tasks", type=int, default=MIN_TASKS)
+    ap.add_argument("--max-format-error-rate", type=float, default=MAX_FORMAT_ERROR_RATE)
     a = ap.parse_args(argv)
-    summary = build(a.records, a.ids, a.tasks, a.out_ids, a.out_json, a.k, a.min_tasks)
+    summary = build(a.records, a.ids, a.tasks, a.out_ids, a.out_json, a.k, a.min_tasks, a.max_format_error_rate)
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     return 4 if "stop" in summary else 0
 

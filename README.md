@@ -68,6 +68,10 @@ uv run python -m arl.rollout.calibrate pilot --config configs/rollout.json --nam
 
 每个 episode 判完分就追加到 `runs/calibration/<name>.jsonl`，中断后重跑同一条命令会接着跑；汇总写到 `<name>-summary.json`。
 
+## 服务器（4090）
+
+脚本在 `scripts/server/`。AutoDL 上常用的学术加速是登录后在当前 shell 执行 `source /etc/network_turbo`，只对这个 shell 生效。脚本不调用它。需要 Hugging Face 镜像时，自己在外面设置 `HF_ENDPOINT`，`huggingface_hub` 会读这个变量。
+
 ## 付费 API（DeepSeek）
 
 配置从仓库根目录的 `.env` 读取（模板见 `.env.example`，`.env` 不进 git），已经设置的环境变量优先。每次运行都必须给花费上限：

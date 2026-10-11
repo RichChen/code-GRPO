@@ -1,4 +1,5 @@
 """The GRPO loss and step on tiny random models (CPU). Needs torch and transformers (``~/.venvs/train``)."""
+import math
 import statistics
 
 import pytest
@@ -7,7 +8,7 @@ torch = pytest.importorskip("torch")
 transformers = pytest.importorskip("transformers")
 
 from arl.rl.batch import Episode, Sequence, Turn, sequences, t_norm  # noqa: E402
-from arl.rl.loss import completion_logps, k3, policy_loss, train_step  # noqa: E402
+from arl.rl.loss import completion_logps, k3, policy_loss, token_entropy, train_step  # noqa: E402
 
 
 def tiny_model(vocab=16, seed=0):
@@ -37,6 +38,27 @@ def test_policy_loss_value_tis_weights_and_gradient():
     assert torch.allclose(logp.grad, torch.tensor([-0.05, -0.1, -0.05]))  # -A * w / T_norm
     loss2, _, capped2 = policy_loss(logp.detach().requires_grad_(), vllm, 0.5, 10.0, None)
     assert capped2 == 0 and torch.isclose(loss2, torch.tensor(-0.5 * -3.5 / 10.0))
+
+
+def test_token_entropy_is_per_token_and_stays_out_of_the_graph():
+    vocab = 8
+    uniform = torch.zeros(2, vocab)
+    assert torch.allclose(token_entropy(uniform), torch.full((2,), math.log(vocab)))
+    peaked = torch.full((1, vocab), -1e3)
+    peaked[0, 3] = 1e3
+    assert float(token_entropy(peaked)) < 1e-4
+    logits = torch.randn(3, vocab, requires_grad=True)
+    ent = token_entropy(logits.detach())
+    assert not ent.requires_grad and ent.shape == (3,)
+    model = tiny_model()
+    params = list(model.parameters())
+    opt = torch.optim.AdamW(params, lr=1e-3, weight_decay=0.0)
+    s = Sequence([1, 2, 3, 4, 5], 2, [-1.0, -1.0, -1.0], 1.0, 0, 0)
+    stats = train_step(model, params, opt, torch.amp.GradScaler("cpu", enabled=False), [s], 8.0, tis_cap=2.0,
+                       max_grad_norm=1.0, device="cpu")
+    assert stats["completion_entropy_mean"] > 0
+    # the entropy term is detached: a second token's logit gradient comes only from the loss
+    assert all(p.grad is None or torch.isfinite(p.grad).all() for p in params)
 
 
 def test_k3_is_zero_for_equal_policies_and_positive_otherwise():

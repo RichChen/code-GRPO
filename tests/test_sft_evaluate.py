@@ -1,4 +1,4 @@
-from arl.sft.evaluate import bootstrap_ci, calibration_estimate, compare, per_task_rates
+from arl.sft.evaluate import SFT_DEV_STRICT_CI, bootstrap_ci, calibration_estimate, compare, in_sft_dev_interval, per_task_rates
 from test_rollout import toy
 
 
@@ -15,6 +15,12 @@ def test_per_task_rates_use_strict_or_test_challenge_verdicts():
     recs = [rec("a", 0, 1, True), rec("a", 1, 0, True), rec("b", 0, 0, False), rec("b", 1, 0, True)]
     assert per_task_rates(recs) == {"a": 0.5, "b": 0.0}
     assert per_task_rates(recs, "non_generated") == {"a": 1.0, "b": 0.5}
+
+
+def test_audited_sft_dev_rate_is_inside_its_interval_and_the_edges_count():
+    lo, hi = SFT_DEV_STRICT_CI
+    assert in_sft_dev_interval(0.535) and in_sft_dev_interval(lo) and in_sft_dev_interval(hi)
+    assert not in_sft_dev_interval(lo - 0.001) and not in_sft_dev_interval(hi + 0.001)
 
 
 def test_bootstrap_interval_brackets_the_mean_and_is_reproducible():

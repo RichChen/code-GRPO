@@ -27,6 +27,15 @@ from arl.rollout.calibrate import K, TASKS, latest, load_records, summarize
 from arl.sft.split import read_ids
 
 BOOTSTRAP = 10000
+# Audited bootstrap of the fp16 SFT dev eval (runs/sft-eval/dev-sft.jsonl), 10000 resamples over tasks, seed 0.
+SFT_DEV_STRICT_RATE = 0.535
+SFT_DEV_STRICT_CI = (0.455, 0.6125)
+
+
+def in_sft_dev_interval(rate: float) -> bool:
+    """True when a strict solve rate sits inside the audited 95% interval of 53.5%."""
+    lo, hi = SFT_DEV_STRICT_CI
+    return lo <= rate <= hi
 
 
 def per_task_rates(recs: list[dict[str, Any]], key: str = "reward") -> dict[str, float]:

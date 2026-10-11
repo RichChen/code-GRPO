@@ -5,7 +5,7 @@ import pytest
 
 from arl.rl import config as rlconfig
 from arl.rl.batch import Episode, Turn, batch_stats, group_advantages, sequences, t_norm, turn_from_record
-from arl.rl.grpo import step_task_ids, training_ids
+from arl.rl.grpo import entropy_collapse_stop, format_rate_stop, step_task_ids, training_ids
 from arl.rl.rollout import collect, episode_seed
 from arl.rollout.client import ClientConfig
 
@@ -76,6 +76,33 @@ def test_t_norm_is_a_fixed_constant_and_batch_stats():
     s = batch_stats([ep(0, 0, 1, [turn([1, 2], [3]), turn([1, 2, 3], [4, 5])]), ep(0, 1, 0, [turn([1], [2])])])
     assert s["reward_mean"] == 0.5 and s["turns_mean"] == 1.5 and s["completion_tokens_max"] == 3
     assert s["sequence_tokens"] == 3 + 5 + 2
+    bad = ep(0, 0, 0, [turn([1], [2])])
+    bad.format_errors, bad.tool_calls = 1, 4
+    ok = ep(0, 1, 1, [turn([1], [2])])
+    ok.tool_calls = 6
+    s = batch_stats([bad, ok])
+    assert s["format_error_rate_per_tool_call"] == 0.1
+    assert s["episodes_with_format_error"] == 1 and s["episodes_with_format_error_fraction"] == 0.5
+    assert batch_stats([ok]).get("format_error_rate_per_tool_call") == 0.0
+
+
+def test_format_error_stop_is_the_mean_per_call_rate_over_ten_steps():
+    assert format_rate_stop([0.2] * 9) is None
+    assert format_rate_stop([0.2] * 10) is not None
+    assert format_rate_stop([0.0] * 5 + [0.2] * 5) is None  # mean 0.10, the limit is exclusive
+    assert format_rate_stop([0.0] * 5 + [0.2001] * 5) is not None
+    assert format_rate_stop([0.5] * 10 + [0.01] * 10) is None  # only the last 10 steps count
+    assert format_rate_stop([0.2] * 9 + [None]) is None  # a step with no tool calls breaks the run
+
+
+def test_entropy_stop_compares_with_the_first_five_steps():
+    assert entropy_collapse_stop([1.0] * 5) is None
+    assert entropy_collapse_stop([1.0] * 5 + [0.30]) is None  # 30% of the baseline is the floor, not a breach
+    assert entropy_collapse_stop([1.0] * 5 + [0.29]) is not None
+    # a slow slide still trips the original baseline; the mean of the previous 5 (0.7) would not
+    slow = [1.0] * 5 + [0.9, 0.8, 0.7, 0.6, 0.5, 0.29]
+    assert entropy_collapse_stop(slow) is not None
+    assert entropy_collapse_stop([2.0, 2.0, 2.0, 2.0, 2.0, 0.7]) is None  # 0.7 > 0.3 * 2.0
 
 
 def write_cfg(tmp_path, **client):

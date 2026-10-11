@@ -841,6 +841,34 @@ CHECKPOINT-2A 审计通过。审计修订 2A-2 补在 `PHASE-2-SFT.zh-CN.md` 末
 - 试点每次调用的格式错误率是 3.45%，低于 6%，**按新判定通过**。出错 episode 的比例 18% 继续报告，不再当门槛。
 - 采样参数保持 temperature 1.0、top_p 1.0、top_k 0。接着用同一个记录文件跑全量校准，试点的 50 题不重跑。
 
+## 第 2 步：全量校准进行中
+
+- `scripts/calibrate_rl.sh full` 已启动。记录仍是 `runs/grpo-calib/rl-train.jsonl`，试点的 200 条（50 题）按断点续跑跳过。
+- 新 session 开局大约 770 episode/小时。跑完才生成 `grpo_v1_ids.txt` 和 `grpo_v1.json`。保留题少于 400，或每次调用的格式错误率超过 6%，就停下，不打 tag。
+- 题集生成在 `arl.rl.taskset`：6% 整不算超过，超过 6% 时删除已写出的题号文件并退出码 4。
+
+## 第 3 步的监控（代码已写，GPU 还没跑）
+
+校准占着这张卡。下面这些不占 GPU，测试已过；sleep 探测、过拟合、同步检查等校准结束再做。
+
+- `batch_stats` 增加每次调用的格式错误率，以及出错 episode 的比例。次数仍然报告。
+- `loss.token_entropy`：completion 位置上每个 token 一个熵，再取平均。从 detach 后的 logits 算，不进梯度。`train_step` 把均值记成 `completion_entropy_mean`。
+- 停止条件在 `grpo.py`：
+  - 连续 10 步的每次调用格式错误率均值超过 10% 才停，等于 10% 不停。某一步没有工具调用（比率是空）会打断这 10 步。
+  - 平均熵低于**前 5 步**均值的 30% 才停。基线是训练开始的 5 步，不是滑动窗口，这样慢慢坍缩也能被看见。等于 30% 不停。第 6 步起才检查。断点续跑从 `log.jsonl` 把这两列读回来。
+- `configs/grpo/v1.json` 的 `stop` 写上了这四个数。过拟合配置继承它们。30 步的过拟合也会检查熵。
+- `max_completion_tokens_per_episode` 仍是 4096。等全量校准的 completion token p99 出来，再向上取整到 256 的倍数。
+
+## 第 4 步和第 5 步：脚本和预注册已写，没有上服务器
+
+- `scripts/server/`：`setup.sh`、`selfcheck.sh`、`merge_bf16.sh`、`bench.sh`、`sync.md`。本地只做了 `bash -n`，以及驱动 CUDA 版本比较（13.0 以下拒绝）。没有在服务器上执行。
+- `setup.sh` 固定 vLLM 0.31.0 和 `requirements-train.txt` 里的 torch 2.13.0+cu130。驱动 CUDA 低于 13.0 就停下，不换别的 torch。`HF_ENDPOINT` 由环境变量传入，脚本不设镜像。
+- `selfcheck.sh` 要求 bwrap 可用，沙箱测试有跳过就失败，然后跑三个环境的测试，并检查 bf16。
+- `merge_bf16.sh` 把适配器合并进 bf16 基座（拒绝 `runs/sft-preview/merged`），dev 上用 bfloat16 服务和 token 客户端评测。严格解出率要落在 [0.455, 0.6125]。
+- `bench.sh` 先探测 sleep level 1 和 level 2，再试 1 步 colocate。放得下就在同一次运行里续到 3 步；放不下就改用 sleep（两边 sleep 都失败则用 restart）跑 3 步，并按步时估算 200 步。
+- AutoDL 的 `source /etc/network_turbo` 写在 README，不写进脚本。
+- 留出集预注册：`docs/plan/HELDOUT-PREREG.zh-CN.md`。只读了题号和 `meta`，没有跑模型。
+
 ## 第 3 步的代码（未在 GPU 上运行）
 
 试点期间按要求并行写了不占 GPU 的部分，和测试一起提交。

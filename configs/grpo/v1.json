@@ -34,7 +34,14 @@
   "eval": {"every": 25, "ids": "data/tasks/dev_ids.txt", "k": 4, "client": "configs/sft/v1-eval.json", "concurrency": 8},
   "measure": null,
   "sync_check": {"greedy_tokens": 32, "max_logprob_mad": 0.05},
-  "stop": {"max_logprob_diff_mean": 0.05, "max_skipped_steps": 3},
+  "stop": {
+    "max_logprob_diff_mean": 0.05,
+    "max_skipped_steps": 3,
+    "format_error_rate_per_call": 0.10,
+    "format_error_window": 10,
+    "entropy_baseline_steps": 5,
+    "entropy_collapse_ratio": 0.30
+  },
   "vllm": {
     "dtype": "half",
     "max_model_len": 8192,

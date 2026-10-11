@@ -56,6 +56,57 @@ def step_task_ids(ids: list[str], n: int, step: int, seed: int) -> list[str]:
     return out
 
 
+def format_rate_stop(rates: list[float | None], window: int = 10, limit: float = 0.10) -> str | None:
+    """Stop when the mean per-call format-error rate over the last ``window`` steps exceeds ``limit``.
+
+    The rate is errors per tool call, not the fraction of episodes that erred once. A step with no tool
+    calls (rate ``None``) breaks the run of consecutive steps.
+    """
+    if len(rates) < window:
+        return None
+    recent = rates[-window:]
+    if any(r is None for r in recent):
+        return None
+    mean = statistics.fmean(recent)
+    if mean > limit:
+        return f"mean per-call format-error rate over {window} steps is {mean:.4f} > {limit}"
+    return None
+
+
+def entropy_collapse_stop(entropies: list[float], baseline_steps: int = 5, ratio: float = 0.30) -> str | None:
+    """Stop when the latest entropy is below ``ratio`` of the mean of the first ``baseline_steps``.
+
+    The baseline is the start of training, not a rolling window: a slow collapse still crosses it.
+    The check begins on the first step after the baseline. Entropy is the mean over completion tokens.
+    """
+    if len(entropies) <= baseline_steps:
+        return None
+    base = statistics.fmean(entropies[:baseline_steps])
+    current = entropies[-1]
+    if current < ratio * base:
+        return (f"completion entropy {current:.4f} < {ratio} of the first {baseline_steps} steps' "
+                f"mean {base:.4f}")
+    return None
+
+
+def logged_monitors(path: Path) -> tuple[list[float | None], list[float]]:
+    """Per-step format-error rates and entropies already written to ``log.jsonl`` (for resume)."""
+    rates: list[float | None] = []
+    entropies: list[float] = []
+    if not path.exists():
+        return rates, entropies
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        rec = json.loads(line)
+        if rec.get("type") != "step":
+            continue
+        rates.append(rec.get("format_error_rate_per_tool_call"))
+        if rec.get("completion_entropy_mean") is not None:
+            entropies.append(rec["completion_entropy_mean"])
+    return rates, entropies
+
+
 def check_prompt(task: Task, renderer: Any) -> list[int]:
     return renderer.encode(renderer.render(initial_messages(task), True))
 
@@ -111,11 +162,14 @@ class Run:
         self.step = 0
         self.adapter = ("step-0", Path(cfg["init_adapter"]))
         self.skipped_in_row = 0
+        self.format_rates: list[float | None] = []
+        self.entropies: list[float] = []
         state = self.out / "state.json"
         if resume and state.exists():
             s = json.loads(state.read_text())
             self.step, self.adapter = s["step"], (s["adapter_name"], Path(s["adapter_path"]))
             self.trainer.load_state(self.out / "trainer.pt")
+            self.format_rates, self.entropies = logged_monitors(self.log_path)
         elif not resume:
             self.log_path.unlink(missing_ok=True)
         self.t0 = time.time()
@@ -236,6 +290,17 @@ class Run:
             raise Stop(f"trainer/vLLM logprob difference {rec['logprob_diff_mean']:.4f} > {stop['max_logprob_diff_mean']}")
         if self.skipped_in_row > stop["max_skipped_steps"]:
             raise Stop(f"{self.skipped_in_row} optimizer steps in a row skipped by the GradScaler")
+        self.format_rates.append(rec.get("format_error_rate_per_tool_call"))
+        reason = format_rate_stop(self.format_rates, stop.get("format_error_window", 10),
+                                   stop.get("format_error_rate_per_call", 0.10))
+        if reason:
+            raise Stop(reason)
+        if rec.get("completion_entropy_mean") is not None:
+            self.entropies.append(rec["completion_entropy_mean"])
+            reason = entropy_collapse_stop(self.entropies, stop.get("entropy_baseline_steps", 5),
+                                           stop.get("entropy_collapse_ratio", 0.30))
+            if reason:
+                raise Stop(reason)
 
     def run(self) -> dict[str, Any]:
         cfg = self.cfg
