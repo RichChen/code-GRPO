@@ -28,7 +28,7 @@
   "adam_betas": [0.9, 0.999],
   "weight_decay": 0.0,
   "max_grad_norm": 1.0,
-  "max_completion_tokens_per_episode": 4096,
+  "max_completion_tokens_per_episode": 2560,
   "tis": {"enabled": true, "cap": 2.0},
   "kl": {"beta": 0.0, "max_sequences": null},
   "eval": {"every": 25, "ids": "data/tasks/dev_ids.txt", "k": 4, "client": "configs/sft/v1-eval.json", "concurrency": 8},

@@ -8,6 +8,7 @@
     "steps": 30,
     "eval": {"every": 0},
     "measure": {"k": 8},
-    "out_dir": "runs/grpo-overfit"
+    "out_dir": "runs/grpo-overfit",
+    "vllm": {"memory_mode": "restart"}
   }
 }
