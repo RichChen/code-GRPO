@@ -4,6 +4,7 @@
   "endpoint": "tokens",
   "temperature": 0.8,
   "top_p": 1.0,
+  "top_k": 20,
   "max_tokens": 1024,
   "timeout_s": 300,
   "retries": 5,

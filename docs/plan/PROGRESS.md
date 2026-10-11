@@ -773,3 +773,19 @@ CHECKPOINT-2A 审计通过。审计修订 2A-2 补在 `PHASE-2-SFT.zh-CN.md` 末
 - 所以第 1 步通过。
 - 整条轨迹的贪心比对改为参考指标：新客户端对旧客户端 7 / 10，旧客户端对自己 7 / 10。
 - 环境保持 `phase1-env-v1` 不变。
+
+## 采样参数配置（修订 2C-1 第 3 条）
+
+- **评测配置** `configs/sft/v1-eval.json`：temperature 0.8、top_p 1.0，显式写上 `top_k: 20`。
+  - 效果和以前不设一样：不设时服务端取模型 `generation_config` 里的 top_k，基座快照和 `runs/sft-preview/merged` 的 `generation_config.json` 都是 20。
+  - 写死以后，不再受模型目录里 `generation_config` 的影响。
+- **校准和 GRPO 配置** `configs/grpo/calibrate-v1.json`：temperature 1.0、top_p 1.0、`top_k: 0`。
+- **测试** `tests/test_sampling_configs.py` 核对三件事：
+  - 评测配置的四个值；
+  - 评测的 top_k 等于快照 `generation_config` 里的值；
+  - 校准配置是 (1.0, 1.0, 0)。
+- 拒绝启动 GRPO 的检查放在第 3 步的训练代码里。
+
+测试结果：
+- `uv run pytest -q` → 260 passed，3 skipped；
+- `~/.venvs/vllm` 全量 → 265 passed，1 skipped。
