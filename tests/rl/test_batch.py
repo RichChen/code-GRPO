@@ -135,6 +135,18 @@ def test_config_checks_and_the_shipped_config(tmp_path):
         rlconfig.validate(cfg)
 
 
+def test_learning_rates_follow_revision_2c3():
+    """Production LoRA rate is a constant 1e-5; the overfit run uses 5e-5 and does not add warmup."""
+    v1 = json.loads(open("configs/grpo/v1.json", encoding="utf-8").read())
+    over = json.loads(open("configs/grpo/overfit-local.json", encoding="utf-8").read())
+    assert v1["lr"] == 1e-5 and "warmup" not in v1
+    assert "1e-5" in v1["lr_note"] and "1e-4" in v1["lr_note"]
+    assert over["overrides"]["lr"] == 5e-5 and "5e-5" in over["lr_note"]
+    assert rlconfig.load("configs/grpo/v1.json")["lr"] == 1e-5
+    loaded = rlconfig.load("configs/grpo/overfit-local.json")
+    assert loaded["lr"] == 5e-5 and "warmup" not in loaded
+
+
 def test_config_overrides(tmp_path):
     (tmp_path / "o.json").write_text(json.dumps({"base": "configs/grpo/v1.json",
                                                  "overrides": {"steps": 3, "vllm": {"memory_mode": "restart"}}}))

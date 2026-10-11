@@ -1,6 +1,8 @@
 {
   "base": "configs/grpo/v1.json",
+  "lr_note": "Audit revision 2C-3: this overfit run uses 5e-5, not the production 1e-5. It only checks that the gradient direction learns within 30 steps; it does not validate the production hyperparameters.",
   "overrides": {
+    "lr": 5e-5,
     "task_sample": 8,
     "task_sample_seed": 0,
     "n_tasks": 8,
