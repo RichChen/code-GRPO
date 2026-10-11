@@ -889,6 +889,11 @@ CHECKPOINT-2A 审计通过。审计修订 2A-2 补在 `PHASE-2-SFT.zh-CN.md` 末
 - AutoDL 的 `source /etc/network_turbo` 写在 README，不写进脚本。
 - 留出集预注册：`docs/plan/HELDOUT-PREREG.zh-CN.md`。只读了题号和 `meta`，没有跑模型。
 
+## 审计修订 2C-3
+
+- 修订原文补在 `PHASE-2C-LOCAL-PREP.zh-CN.md` 第 0 节末尾，放在 2C-2 后面。2A-2 原文不改；第 2 条替换其中“合并到 bf16 原始基座”的做法。
+- 本轮按修订执行：正式学习率 1e-5、过拟合 5e-5；训练、采样、评测统一 fp16；留出集预注册留修订记录；先测量再以数值等价的方式降低 `train_step` 显存，然后重跑本地过拟合；再查 cu128/cu126 wheel，准备驱动备用环境。然后写 `CHECKPOINT-2C`。
+
 ## 第 3 步的代码（未在 GPU 上运行）
 
 试点期间按要求并行写了不占 GPU 的部分，和测试一起提交。
