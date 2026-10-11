@@ -841,11 +841,28 @@ CHECKPOINT-2A 审计通过。审计修订 2A-2 补在 `PHASE-2-SFT.zh-CN.md` 末
 - 试点每次调用的格式错误率是 3.45%，低于 6%，**按新判定通过**。出错 episode 的比例 18% 继续报告，不再当门槛。
 - 采样参数保持 temperature 1.0、top_p 1.0、top_k 0。接着用同一个记录文件跑全量校准，试点的 50 题不重跑。
 
-## 第 2 步：全量校准进行中
+## 第 2 步：全量校准（修订 2C-2）
 
-- `scripts/calibrate_rl.sh full` 已启动。记录仍是 `runs/grpo-calib/rl-train.jsonl`，试点的 200 条（50 题）按断点续跑跳过。
-- 新 session 开局大约 770 episode/小时。跑完才生成 `grpo_v1_ids.txt` 和 `grpo_v1.json`。保留题少于 400，或每次调用的格式错误率超过 6%，就停下，不打 tag。
-- 题集生成在 `arl.rl.taskset`：6% 整不算超过，超过 6% 时删除已写出的题号文件并退出码 4。
+- `scripts/calibrate_rl.sh full` 续跑 `runs/grpo-calib/rl-train.jsonl`，试点的 200 条没有重跑。1853 题 × K=4，7412 个 episode，报错 0，逐轮 tokenize 不一致 0。墙钟约 7.9 小时，吞吐 917 episode/小时。
+- 本地仍是 fp16 的 `runs/sft-preview/merged`。服务器上的起点是 bf16 合并，差别留到 `merge_bf16.sh` 的 dev 核对。
+- **两条停止线都没踩中**：保留 1018 题（门槛 400）；每次调用的格式错误率 4.27%（门槛 6%）。出错 episode 的比例 17.2%，只作报告。
+- 题集：`data/tasks/grpo_v1_ids.txt`、`data/tasks/grpo_v1.json`。1018 题、331 个函数，sha256 `96de604c58692e62be85b1c519ad1947fbc8478d90a5c904cc91eb2436f057d2`。tag `grpo-tasks-v1`。
+
+| | 全量：rl_train 1853 题，T=1.0，top_k 0 |
+| --- | --- |
+| 严格解出率 | 41.03% |
+| 只看 test 和 challenge | 47.95% |
+| 每次工具调用的格式错误率 | 4.27%（2114 / 49457） |
+| 出现格式错误的 episode | 17.17% |
+| 解出 0/1/2/3/4 次的题数 | 559 / 399 / 319 / 300 / 276 |
+| 解出 1–3 次 | 1018 / 1853（54.9%） |
+| 停止原因 | submitted 4760、max_turns 2651、context_limit 1 |
+| 用满 10 轮 | 35.77% |
+| 平均轮数 | 7.16 |
+| 每个 episode 的输出 token（均值 / p50 / p99 / 最大） | 659.5 / 445 / 2458 / 5136 |
+
+- 格式错误构成：`invalid_arguments` 1248、`malformed_call` 817、`unknown_tool` 49。
+- bug 类型（保留的题）：arith_swap 199、bool_swap 35、compare_swap 150、const_off_by_one 275、remove_branch 138、var_swap 221。每个函数 1 到 9 题，1 题的函数 80 个，9 题的函数 1 个。
 
 ## 第 3 步的监控（代码已写，GPU 还没跑）
 

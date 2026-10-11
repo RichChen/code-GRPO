@@ -1,0 +1,101 @@
+{
+  "source": {
+    "ids": "data/tasks/rl_train_ids.txt",
+    "records": "runs/grpo-calib/rl-train.jsonl",
+    "k": 4,
+    "keep": "solved 1..3 of 4",
+    "model": "SFT-v1 (runs/sft-preview/merged, fp16)",
+    "sampling": "T=1.0, top_p 1.0, top_k 0",
+    "env": "phase1-env-v1"
+  },
+  "tasks": 1018,
+  "functions": 331,
+  "sha256_ids": "96de604c58692e62be85b1c519ad1947fbc8478d90a5c904cc91eb2436f057d2",
+  "bug_types": {
+    "arith_swap": 199,
+    "bool_swap": 35,
+    "compare_swap": 150,
+    "const_off_by_one": 275,
+    "remove_branch": 138,
+    "var_swap": 221
+  },
+  "tasks_per_function": {
+    "1": 80,
+    "2": 72,
+    "3": 52,
+    "4": 62,
+    "5": 26,
+    "6": 21,
+    "7": 11,
+    "8": 6,
+    "9": 1
+  },
+  "solve_count_distribution": {
+    "0": 559,
+    "1": 399,
+    "2": 319,
+    "3": 300,
+    "4": 276
+  },
+  "calibration": {
+    "episodes": 7412,
+    "solve_rate_strict": 0.4103,
+    "solve_rate_test_challenge": 0.4795,
+    "solve_count_distribution": {
+      "0": 559,
+      "1": 399,
+      "2": 319,
+      "3": 300,
+      "4": 276
+    },
+    "stop_reasons": {
+      "submitted": 4760,
+      "max_turns": 2651,
+      "context_limit": 1
+    },
+    "max_turns_fraction": 0.3577,
+    "episodes_with_format_error": 0.1717,
+    "format_error_rate_per_tool_call": 0.0427,
+    "turns_mean": 7.162,
+    "nudged_fraction": 0.0826,
+    "tokens_per_episode": {
+      "completion": {
+        "mean": 659.5,
+        "median": 445.0,
+        "p90": 1461,
+        "p95": 1827,
+        "p99": 2458,
+        "max": 5136
+      },
+      "prompt_summed_over_turns": {
+        "mean": 13595.3,
+        "median": 11619.0,
+        "p90": 23459,
+        "p95": 25473,
+        "p99": 29462,
+        "max": 40869
+      },
+      "trained_sequence_tokens": {
+        "mean": 14254.8,
+        "median": 12355.5,
+        "p90": 24612,
+        "p95": 26780,
+        "p99": 31115,
+        "max": 45841
+      },
+      "final_context": {
+        "mean": 2663.7,
+        "median": 2492.0,
+        "p90": 4082,
+        "p95": 4480,
+        "p99": 5319,
+        "max": 7206
+      }
+    },
+    "finish_reasons": {
+      "stop": 52112,
+      "length": 975
+    },
+    "tokenize_mismatches": 0
+  }
+}
