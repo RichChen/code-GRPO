@@ -1,10 +1,12 @@
-"""Merge the SFT-v1 LoRA into the original bf16 base.
+"""Merge the SFT-v1 LoRA into the base loaded as fp16.
 
-    PYTHONPATH=src ~/.venvs/train/bin/python -m arl.sft.merge_bf16 \
+    PYTHONPATH=src ~/.venvs/train/bin/python -m arl.sft.merge_fp16 \
         --base Qwen/Qwen3-1.7B --revision 70d244cc86ccca08cf5af4e1e306ecf908b1ad5e \
-        --adapter runs/sft-v1/adapter --out runs/sft-v1/merged-bf16
+        --adapter runs/sft-v1/adapter --out runs/sft-v1/merged-fp16
 
-The local fp16 ``runs/sft-preview/merged`` must not be the base: casting those weights to bf16 drops mantissa bits.
+The checkpoint on disk is bf16. Loading it as fp16 matches SFT-v1, the local calibration, and vLLM
+``--dtype half``. Do not start from ``runs/sft-preview/merged``: the server merges the frozen adapter
+itself, from the original snapshot.
 """
 from __future__ import annotations
 
@@ -21,9 +23,9 @@ from arl.sft.train import TOKENIZER_FILES  # noqa: E402
 FORBIDDEN = "sft-preview/merged"
 
 
-def merge_bf16(base: str, revision: str, adapter: Path, dest: Path) -> None:
+def merge_fp16(base: str, revision: str, adapter: Path, dest: Path) -> None:
     if FORBIDDEN in base.replace("\\", "/"):
-        raise ValueError(f"refusing to start from the local fp16 merge ({base})")
+        raise ValueError(f"refusing to start from the local preview merge ({base}); load the original base as fp16")
     import torch
     from huggingface_hub import snapshot_download
     from peft import PeftModel
@@ -31,10 +33,11 @@ def merge_bf16(base: str, revision: str, adapter: Path, dest: Path) -> None:
 
     if torch.cuda.is_available():
         torch.cuda.set_per_process_memory_fraction(0.9)
-        device, dtype = "cuda", torch.bfloat16
+        device = "cuda"
     else:
-        device, dtype = "cpu", torch.bfloat16
-    model = AutoModelForCausalLM.from_pretrained(base, revision=revision, dtype=dtype, attn_implementation="sdpa")
+        device = "cpu"
+    model = AutoModelForCausalLM.from_pretrained(base, revision=revision, dtype=torch.float16,
+                                                 attn_implementation="sdpa")
     model = PeftModel.from_pretrained(model, str(adapter)).to(device)
     merged = model.merge_and_unload()
     if dest.exists():
@@ -51,9 +54,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--base", default="Qwen/Qwen3-1.7B")
     ap.add_argument("--revision", default="70d244cc86ccca08cf5af4e1e306ecf908b1ad5e")
     ap.add_argument("--adapter", type=Path, default=Path("runs/sft-v1/adapter"))
-    ap.add_argument("--out", type=Path, default=Path("runs/sft-v1/merged-bf16"))
+    ap.add_argument("--out", type=Path, default=Path("runs/sft-v1/merged-fp16"))
     a = ap.parse_args(argv)
-    merge_bf16(a.base, a.revision, a.adapter, a.out)
+    merge_fp16(a.base, a.revision, a.adapter, a.out)
     print(a.out)
     return 0
 

@@ -133,7 +133,7 @@
 
 ### 第 2 步：用 SFT-v1 在 `rl_train_ids` 上校准
 
-- 本地 vLLM 加载 fp16 的 `merged/` 来跑。服务器上用的是 bf16 合并的模型，和本地有一点数值差别。这一点要写进 PROGRESS，服务器上会在 dev 集上核对（见第 4 步）。
+- 本地 vLLM 加载 fp16 的合并模型来跑。修订 2C-3 之后服务器也用 fp16 合并（`merge_fp16.sh`），并在 dev 集上再核对一次。
 - 1853 题，每题 K=4，temperature 1.0（修订 2A-2 第 4 条），环境 `phase1-env-v1`，要能断点续跑。按现在的吞吐量估计约 6–7 小时。
 - 输出：
   - `data/tasks/grpo_v1_ids.txt`：解出 1–3 次的题；
@@ -201,7 +201,7 @@
   - 沙箱隔离自检，沿用阶段 1 的 13 项 bwrap 检查。这是阶段 0 一直没在服务器上验证过的事。bwrap 在容器里不能用的话，就停下报告，不能退回到不隔离的模式；
   - 全量测试；
   - GPU 型号、显存、bf16 支持。
-- **`merge_bf16.sh`**：把 `runs/sft-v1/adapter` 合并到 bf16 基座，然后在 dev 集上用新客户端评测，K=4、temperature 0.8。严格解出率要落在 53.5% 的 bootstrap 95% 置信区间里，否则停下报告。
+- **`merge_fp16.sh`**（修订 2C-3，替换原来的 `merge_bf16.sh`）：把 `runs/sft-v1/adapter` 合并到以 fp16 加载的基座，vLLM 用 `--dtype half`，然后在 dev 集上用新客户端评测，K=4、temperature 0.8。严格解出率要落在 53.5% 的 bootstrap 95% 置信区间 [45.5%, 61.25%] 里，否则停下报告。
 - **`bench.sh`**：跑 3 个 GRPO 步，报告每一步的耗时和显存，并按这个速度估算 200 步要多久。
 - **`sync.md`**：写清哪些文件要传到服务器（适配器、题集的 jsonl、`.env` 不传），以及怎么用 rsync 把 `runs/` 拉回本地。
 

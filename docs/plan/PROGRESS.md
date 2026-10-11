@@ -901,6 +901,13 @@ CHECKPOINT-2A 审计通过。审计修订 2A-2 补在 `PHASE-2-SFT.zh-CN.md` 末
 - 训练端本来就是恒定的 AdamW 学习率，没有调度器，所以没有额外关掉 warmup 的代码。
 - 测试：`tests/rl/test_batch.py` 检查正式配置是 1e-5、过拟合覆盖是 5e-5、两边都没有 warmup。`uv run pytest -q` 282 passed、6 skipped；`~/.venvs/train` 的 train/rl/tokenclient/hermes 58 passed、3 skipped；`~/.venvs/vllm` 全量 294 passed、2 skipped。
 
+## 修订 2C-3 第 2 条：合并脚本改为 fp16
+
+- `scripts/server/merge_bf16.sh` 改名为 `merge_fp16.sh`。`arl.sft.merge_fp16` 把原始基座以 fp16 加载，合并 SFT-v1 适配器，写到 `runs/sft-v1/merged-fp16`。仍然拒绝从 `runs/sft-preview/merged` 起步。
+- vLLM 用 `--dtype half`。dev 集 K=4、temperature 0.8，严格解出率仍要落在 [0.455, 0.6125]。
+- `sync.md` 和 `configs/sft/v1.json` 的说明改成 fp16 合并。本地基线还没跑，下一提交写数字。
+- 测试：`bash -n scripts/server/merge_fp16.sh` 通过；`~/.venvs/train` 里 `tests/train/test_merge_fp16.py` 1 passed。三套全量：uv 282 passed、6 skipped（第一次和 vLLM 套件并行时 `test_fork_bomb_is_blocked_by_process_limit[rlimit_only]` 因进程数竞态失败，单独重跑通过）；train 58 passed、3 skipped；vLLM 294 passed、2 skipped。
+
 ## 第 3 步的代码（未在 GPU 上运行）
 
 试点期间按要求并行写了不占 GPU 的部分，和测试一起提交。
