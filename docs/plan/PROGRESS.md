@@ -908,6 +908,13 @@ CHECKPOINT-2A 审计通过。审计修订 2A-2 补在 `PHASE-2-SFT.zh-CN.md` 末
 - `sync.md` 和 `configs/sft/v1.json` 的说明改成 fp16 合并。本地基线还没跑，下一提交写数字。
 - 测试：`bash -n scripts/server/merge_fp16.sh` 通过；`~/.venvs/train` 里 `tests/train/test_merge_fp16.py` 1 passed。三套全量：uv 282 passed、6 skipped（第一次和 vLLM 套件并行时 `test_fork_bomb_is_blocked_by_process_limit[rlimit_only]` 因进程数竞态失败，单独重跑通过）；train 58 passed、3 skipped；vLLM 294 passed、2 skipped。
 
+## 修订 2C-3 第 2 条：本地 fp16 合并的 dev 基线
+
+- 本机跑了 `scripts/server/merge_fp16.sh`。合并结果在 `runs/sft-v1/merged-fp16`（不入库）。vLLM `--dtype half`，dev 100 题 × K=4，token 客户端，temperature 0.8、top_p 1.0、top_k 20。
+- **严格解出率 55.5%**，落在 [45.5%, 61.25%] 里，脚本退出码 0。之前 fp16 预览合并模型的 dev 严格解出率是 53.5%。
+- 400 个 episode，报错 0。逐轮 tokenize 比对 2577 轮，不一致 0。每次调用的格式错误率 1.80%（42 / 2315）。出错 episode 比例 5.8%。平均轮数 6.44。吞吐 922.6 episode/小时。墙钟约 30.1 分钟（含合并和 vLLM 启动）。
+- 没有在留出集上跑。服务器上还要再跑一次对照。
+
 ## 第 3 步的代码（未在 GPU 上运行）
 
 试点期间按要求并行写了不占 GPU 的部分，和测试一起提交。
