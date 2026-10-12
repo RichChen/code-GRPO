@@ -11,6 +11,8 @@ EVAL=$ROOT/runs/sft-eval
 NAME=dev-sft-fp16
 VLLM=~/.venvs/vllm/bin/vllm
 PY=~/.venvs/vllm/bin/python
+# FlashInfer JIT-builds its sampling kernels on first use and calls `ninja`, which lives in this venv's bin.
+export PATH="$HOME/.venvs/vllm/bin:$PATH"
 mkdir -p "$EVAL"
 
 PYTHONPATH=src HF_HUB_OFFLINE=1 ~/.venvs/train/bin/python -m arl.sft.merge_fp16 --out "$OUT"

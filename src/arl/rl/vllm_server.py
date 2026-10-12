@@ -60,6 +60,8 @@ class VLLMServer:
 
     def env(self) -> dict[str, str]:
         env = dict(os.environ, VLLM_ALLOW_RUNTIME_LORA_UPDATING="1", VLLM_SERVER_DEV_MODE="1", HF_HUB_OFFLINE="1")
+        # FlashInfer JIT-builds its sampling kernels with `ninja` from the vLLM venv.
+        env["PATH"] = os.pathsep.join([str(VLLM.parent), env.get("PATH", "")])
         env.pop("PYTORCH_CUDA_ALLOC_CONF", None)  # the trainer's allocator setting is not vLLM's
         return env
 

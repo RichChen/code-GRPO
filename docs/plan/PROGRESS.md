@@ -1058,3 +1058,28 @@ CHECKPOINT-2A 审计通过。审计修订 2A-2 补在 `PHASE-2-SFT.zh-CN.md` 末
 - **耗时**：`setup.sh` 的环境部分 13:27–14:23（约 56 分钟，主要是 PyPI 下载）；基座下载卡住加等待上传 14:23–15:00；自检两次共约 8 分钟。第 1 步墙钟合计约 1 小时 45 分钟。
 - **磁盘**：根分区已用 42G、可用 145G。`~/.venvs/train` 4.7G，`~/.venvs/vllm` 3.4G，`~/.cache/huggingface` 3.8G。
 - **SFT-v1 核对通过**（`scripts/server/check_sft_v1.py`，结果 `runs/phase3/sft-v1-check.json`）：三个文件的 sha256 和 `configs/sft/v1.json` 一致，`adapter_model.safetensors` 69782384 字节；392 个张量全是 fp32，共 17,432,576 个元素，没有 NaN 或 inf，绝对值最大 0.0391。
+
+## 第 2 步：合并 fp16 并核对 dev 基线
+
+- 预计耗时 15–30 分钟。实际：15:14 开始，第一次 vLLM 没起来；修好后 15:25–15:30 跑完，合并加评测 5 分 17 秒。
+- **第一次 vLLM 启动失败（15:14–15:15）**：预热时 FlashInfer 要 JIT 编译采样 kernel，调用 `ninja` 时报 `FileNotFoundError: 'ninja'`。`ninja` 1.13.2 装在 `~/.venvs/vllm/bin`，但脚本直接调用 `~/.venvs/vllm/bin/vllm`，没有把这个目录放进 PATH。这次一个 episode 都没跑，评测没开始。日志 `runs/sft-eval/dev-sft-fp16-serve-attempt1-no-ninja.log`。
+  - 先单独验证：PATH 里加上 venv 的 bin 后，FlashInfer 的 `sampling` 和 `topk` 两个 JIT 模块编译成功（约 4.5 分钟，缓存在 `~/.cache/flashinfer`，nvcc 用的是 venv 里的 `nvidia-cuda-nvcc` 13.4.92），top_k 20 采样能出结果。
+  - 改动（只改启动环境，不改采样参数）：`scripts/server/merge_fp16.sh` export `~/.venvs/vllm/bin` 到 PATH；`VLLMServer.env()` 把 vLLM 所在的 bin 目录放到 PATH 最前面，GRPO 的 vLLM 子进程也要用到。
+- **第二次通过**：`runs/sft-v1/merged-fp16`，vLLM `--dtype half`，KV cache 276,688 token。dev 100 题 × K=4，temperature 0.8、top_p 1.0、top_k 20，token 客户端，脚本退出码 0。
+
+| | 服务器 fp16 合并 | 本地 fp16 合并（2C-3） | 本地 fp16 预览合并（2A） |
+| --- | --- | --- | --- |
+| **严格解出率** | **55.5%**（区间 [45.5%, 61.25%]，通过） | 55.5% | 53.5% |
+| 非 generated 口径（只看 test 和 challenge） | 59.8% | — | 58.0% |
+| 每次工具调用的格式错误率 | 1.72%（40 / 2320） | 1.80% | 1.9% |
+| 出错 episode 比例（只报告） | 6.2% | 5.8% | 5.8% |
+| 平均轮数 | 6.45 | 6.44 | 6.53 |
+| 停止原因：提交 / 用满轮数 | 308 / 92 | — | 300 / 100 |
+| 每题解出 0/1/2/3/4 次 | 22 / 17 / 9 / 21 / 31 | — | 25 / 18 / 7 / 18 / 32 |
+| 吞吐 | 5603 episode/小时 | 923 | 1214 |
+
+- 400 个 episode，报错 0；逐轮 `/tokenize` 比对 2581 轮，不一致 0。格式错误：`invalid_arguments` 23、`malformed_call` 17。生成结束原因：stop 2542、length 39。
+- 计划里要对比的两个数：本地 53.5% 是 fp16 预览合并的严格口径，55.25% 是 2C 第 1 步新客户端在 dev 上的严格口径。服务器 55.5% 落在这两个数附近，和本地 fp16 合并的 55.5% 相同。
+- 按 bug 类型的严格解出率：arith_swap 69.7%、bool_swap 25.0%、compare_swap 65.0%、const_off_by_one 32.4%、remove_branch 47.7%、var_swap 68.5%。完整报告 `runs/phase3/step2-dev-report.json`。
+- 吞吐是本地的约 6 倍（单 episode 平均 4.43 秒，并发 8）。按这个速度，留出集每个模型 6000 个 episode 大约要 1.1 小时。
+- 测试：uv 282 passed、6 skipped；vLLM 环境 295 passed、2 skipped；train 环境 tests/train tests/rl 42 passed、1 skipped。
