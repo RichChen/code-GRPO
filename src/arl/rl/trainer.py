@@ -16,7 +16,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch  # noqa: E402
 
-from arl.rl.batch import Sequence  # noqa: E402
+from arl.rl.batch import Sequence, kl_sample  # noqa: E402
 from arl.rl.loss import completion_logps, train_step  # noqa: E402
 
 ADAPTER_FILE = "adapter_model.safetensors"
@@ -145,14 +145,15 @@ class PolicyTrainer:
             if self.trainable() != self.params:
                 raise RuntimeError("switching adapters changed the trainable parameters")
 
-    def step(self, seqs: list[Sequence], t_norm: float) -> dict[str, Any]:
+    def step(self, seqs: list[Sequence], t_norm: float, step: int | None = None) -> dict[str, Any]:
         if self.device == "cuda":
             torch.cuda.reset_peak_memory_stats()
         tis = self.cfg["tis"]
+        kl_indices = kl_sample(len(seqs), self.cfg["kl"].get("max_sequences"), self.cfg.get("seed", 0), step)
         stats = train_step(self.model, self.params, self.opt, self.scaler, seqs, t_norm,
                            tis_cap=tis["cap"] if tis["enabled"] else None, max_grad_norm=self.cfg["max_grad_norm"],
                            device=self.device, amp_dtype=self.amp_dtype(), ref_logps=self.ref_logps,
-                           kl_max_sequences=self.cfg["kl"].get("max_sequences"))
+                           kl_indices=kl_indices)
         stats["lr"] = self.opt.param_groups[0]["lr"]
         if self.device == "cuda":
             stats["peak_allocated_gib"] = round(torch.cuda.max_memory_allocated() / 2**30, 2)

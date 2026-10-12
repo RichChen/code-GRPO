@@ -89,6 +89,26 @@ def entropy_collapse_stop(entropies: list[float], baseline_steps: int = 5, ratio
     return None
 
 
+def collapse_stop(entropies: list[float], mixed: list[float | None], baseline_steps: int = 5, ratio: float = 0.30,
+                  mixed_min: float | None = None, mixed_window: int = 10) -> str | None:
+    """Entropy collapse, and (when ``mixed_min`` is set) no learning signal left.
+
+    With ``mixed_min`` set, low entropy alone does not stop the run: the mean fraction of groups with both
+    successes and failures over the last ``mixed_window`` steps must also be below ``mixed_min`` (most groups all
+    right or all wrong, so no gradient). A step without the fraction breaks the window, like the format check.
+    """
+    reason = entropy_collapse_stop(entropies, baseline_steps, ratio)
+    if reason is None or mixed_min is None:
+        return reason
+    recent = mixed[-mixed_window:]
+    if len(recent) < mixed_window or any(m is None for m in recent):
+        return None
+    mean = statistics.fmean(recent)
+    if mean >= mixed_min:
+        return None
+    return f"{reason}, and the mixed-group fraction over {mixed_window} steps is {mean:.4f} < {mixed_min}"
+
+
 def dev_gain_stop(log_path: Path, step: int, check_step: int | None) -> str | None:
     """At ``check_step``, stop unless the dev strict solve rate is above the step-0 baseline in ``log.jsonl``."""
     if not check_step or step != check_step:
@@ -106,12 +126,13 @@ def dev_gain_stop(log_path: Path, step: int, check_step: int | None) -> str | No
     return None
 
 
-def logged_monitors(path: Path) -> tuple[list[float | None], list[float]]:
-    """Per-step format-error rates and entropies already written to ``log.jsonl`` (for resume)."""
+def logged_monitors(path: Path) -> tuple[list[float | None], list[float], list[float | None]]:
+    """Per-step format-error rates, entropies and mixed-group fractions already in ``log.jsonl`` (for resume)."""
     rates: list[float | None] = []
     entropies: list[float] = []
+    mixed: list[float | None] = []
     if not path.exists():
-        return rates, entropies
+        return rates, entropies, mixed
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
@@ -119,9 +140,22 @@ def logged_monitors(path: Path) -> tuple[list[float | None], list[float]]:
         if rec.get("type") != "step":
             continue
         rates.append(rec.get("format_error_rate_per_tool_call"))
+        mixed.append(rec.get("non_degenerate_fraction"))
         if rec.get("completion_entropy_mean") is not None:
             entropies.append(rec["completion_entropy_mean"])
-    return rates, entropies
+    return rates, entropies, mixed
+
+
+def logged_measure(path: Path, tag: str) -> dict[str, Any] | None:
+    """The last ``measure`` record with ``tag`` in ``log.jsonl``: a resumed run did its ``before`` earlier."""
+    found = None
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                rec = json.loads(line)
+                if rec.get("type") == "measure" and rec.get("tag") == tag:
+                    found = rec
+    return found
 
 
 def check_prompt(task: Task, renderer: Any) -> list[int]:
@@ -181,12 +215,13 @@ class Run:
         self.skipped_in_row = 0
         self.format_rates: list[float | None] = []
         self.entropies: list[float] = []
+        self.mixed: list[float | None] = []
         state = self.out / "state.json"
         if resume and state.exists():
             s = json.loads(state.read_text())
             self.step, self.adapter = s["step"], (s["adapter_name"], Path(s["adapter_path"]))
             self.trainer.load_state(self.out / "trainer.pt")
-            self.format_rates, self.entropies = logged_monitors(self.log_path)
+            self.format_rates, self.entropies, self.mixed = logged_monitors(self.log_path)
         elif not resume:
             self.log_path.unlink(missing_ok=True)
         self.t0 = time.time()
@@ -267,7 +302,7 @@ class Run:
         rec["trainer_build_s"] = round(self.trainer.build(), 2)
         t1 = time.time()
         if seqs:
-            stats = self.trainer.step(seqs, self.t_norm)
+            stats = self.trainer.step(seqs, self.t_norm, step + 1)
             rec.update(stats)
             self.skipped_in_row = self.skipped_in_row + 1 if stats["skipped"] else 0
         else:
@@ -312,10 +347,12 @@ class Run:
                                    stop.get("format_error_rate_per_call", 0.10))
         if reason:
             raise Stop(reason)
+        self.mixed.append(rec.get("non_degenerate_fraction"))
         if rec.get("completion_entropy_mean") is not None:
             self.entropies.append(rec["completion_entropy_mean"])
-            reason = entropy_collapse_stop(self.entropies, stop.get("entropy_baseline_steps", 5),
-                                           stop.get("entropy_collapse_ratio", 0.30))
+            reason = collapse_stop(self.entropies, self.mixed, stop.get("entropy_baseline_steps", 5),
+                                   stop.get("entropy_collapse_ratio", 0.30), stop.get("mixed_group_fraction_min"),
+                                   stop.get("mixed_group_window", 10))
             if reason:
                 raise Stop(reason)
 
@@ -344,9 +381,11 @@ class Run:
                         raise Stop(reason)
             if m:
                 result["after"] = measure([self.tasks[i] for i in self.ids], m["k"], self.client, self.adapter[0],
-                                          cfg, "after")
+                                          cfg, m.get("after_tag", "after"))
                 self.record({"type": "measure", **result["after"]})
-                result["reward_gain"] = round(result["after"]["reward_mean"] - result["before"]["reward_mean"], 4)
+                before = result.get("before") or logged_measure(self.log_path, "before")
+                if before:
+                    result["reward_gain"] = round(result["after"]["reward_mean"] - before["reward_mean"], 4)
             result["status"] = "done"
         except Stop as exc:
             result.update(status="stop", reason=str(exc))

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import math
-from typing import Any, Callable
+from typing import Any, Callable, Collection
 
 import torch
 import torch.nn.functional as F
@@ -95,7 +95,7 @@ def train_step(model: Any, params: list[torch.nn.Parameter], opt: torch.optim.Op
                seqs: list[Sequence], t_norm: float, *, tis_cap: float | None, max_grad_norm: float,
                device: str | torch.device, amp_dtype: torch.dtype | None = None,
                ref_logps: Callable[[Sequence], torch.Tensor] | None = None,
-               kl_max_sequences: int | None = None, chunk_rows: int = CHUNK_ROWS) -> dict[str, Any]:
+               kl_indices: Collection[int] | None = None, chunk_rows: int = CHUNK_ROWS) -> dict[str, Any]:
     """One optimizer update on all ``seqs`` (gradients accumulated sequence by sequence).
 
     Log-probabilities come from a chunked vocab projection. Each chunk is backwarded before the next is
@@ -106,7 +106,7 @@ def train_step(model: Any, params: list[torch.nn.Parameter], opt: torch.optim.Op
     model.train()
     opt.zero_grad(set_to_none=True)
     diffs, kept, ents, loss_sum, capped, tokens = [], [], [], 0.0, 0, 0
-    kl_n = len(seqs) if kl_max_sequences is None else min(len(seqs), kl_max_sequences)
+    kl_set = None if kl_indices is None else set(kl_indices)
     for i, s in enumerate(seqs):
         with amp:
             head, hidden, targets = _completion_hidden(model, s.input_ids, s.start, device)
@@ -131,8 +131,8 @@ def train_step(model: Any, params: list[torch.nn.Parameter], opt: torch.optim.Op
             capped += c
             tokens += len(diff)
             del logits, logp, piece
-        if i < kl_n and seq_logp:
-            kept.append(torch.cat(seq_logp))
+        if (kl_set is None or i in kl_set) and seq_logp:
+            kept.append((torch.cat(seq_logp), s))
     stats: dict[str, Any] = {"sequences": len(seqs), "loss_tokens": tokens, "loss": loss_sum}
     if diffs:
         d = torch.cat(diffs).abs()
@@ -142,7 +142,7 @@ def train_step(model: Any, params: list[torch.nn.Parameter], opt: torch.optim.Op
         stats["completion_entropy_mean"] = float(torch.cat(ents).mean())
     if ref_logps is not None and kept:
         with torch.no_grad():
-            kl = torch.cat([k3(lp, ref_logps(s).to(lp)) for lp, s in zip(kept, seqs)])
+            kl = torch.cat([k3(lp, ref_logps(s).to(lp)) for lp, s in kept])
         stats.update(kl_k3_mean=float(kl.mean()), kl_sequences=len(kept))
     scaler.unscale_(opt)
     gnorm = float(torch.nn.utils.clip_grad_norm_(params, max_grad_norm))

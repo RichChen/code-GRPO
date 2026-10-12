@@ -25,8 +25,13 @@ probe() {
   echo "probe $mode level=${level:-none} exit=$(cat "$dest/exit")"
 }
 
-probe sleep 1 "$OUT/sleep-l1"
-probe sleep 2 "$OUT/sleep-l2"
+# SKIP_PROBES=1 reuses sleep-l1/ and sleep-l2/ from an earlier run (their exit files pick the fallback mode).
+if [ "${SKIP_PROBES:-0}" = 1 ] && [ -f "$OUT/sleep-l1/exit" ] && [ -f "$OUT/sleep-l2/exit" ]; then
+  echo "probes skipped: sleep-l1 exit=$(cat "$OUT/sleep-l1/exit"), sleep-l2 exit=$(cat "$OUT/sleep-l2/exit")"
+else
+  probe sleep 1 "$OUT/sleep-l1"
+  probe sleep 2 "$OUT/sleep-l2"
+fi
 
 write_cfg() {
   local mode=$1 steps=$2 dest=$3

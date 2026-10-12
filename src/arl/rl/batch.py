@@ -7,6 +7,7 @@ extend turn ``t``'s sequence.
 """
 from __future__ import annotations
 
+import random
 import statistics
 from collections import Counter
 from dataclasses import dataclass, field
@@ -83,6 +84,14 @@ def sequences(episodes: list[Episode]) -> tuple[list[Sequence], dict[str, Any]]:
     groups = len(by_group)
     return out, {"groups": groups, "degenerate_groups": skipped,
                  "non_degenerate_fraction": round((groups - skipped) / groups, 4) if groups else None}
+
+
+def kl_sample(n: int, k: int | None, seed: int, step: int | None) -> list[int]:
+    """Indices of the sequences that enter the logged KL estimate: all of them, or ``k`` drawn at random with a
+    seed fixed by ``(seed, step)``. Not the first ``k``: sequences are ordered by group, so a prefix is a few tasks."""
+    if k is None or k >= n:
+        return list(range(n))
+    return sorted(random.Random(f"kl-{seed}-{step}").sample(range(n), k))
 
 
 def t_norm(n_tasks: int, group_size: int, max_completion_tokens_per_episode: int) -> int:

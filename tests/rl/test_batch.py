@@ -4,8 +4,10 @@ import json
 import pytest
 
 from arl.rl import config as rlconfig
-from arl.rl.batch import Episode, Turn, batch_stats, group_advantages, sequences, t_norm, turn_from_record
-from arl.rl.grpo import dev_gain_stop, entropy_collapse_stop, format_rate_stop, step_task_ids, training_ids
+from arl.rl.batch import (Episode, Turn, batch_stats, group_advantages, kl_sample, sequences, t_norm,
+                          turn_from_record)
+from arl.rl.grpo import (collapse_stop, dev_gain_stop, entropy_collapse_stop, format_rate_stop, logged_measure, logged_monitors,
+                         step_task_ids, training_ids)
 from arl.rl.rollout import collect, episode_seed
 from arl.rollout.client import ClientConfig
 
@@ -103,6 +105,60 @@ def test_entropy_stop_compares_with_the_first_five_steps():
     slow = [1.0] * 5 + [0.9, 0.8, 0.7, 0.6, 0.5, 0.29]
     assert entropy_collapse_stop(slow) is not None
     assert entropy_collapse_stop([2.0, 2.0, 2.0, 2.0, 2.0, 0.7]) is None  # 0.7 > 0.3 * 2.0
+
+
+def test_collapse_stop_needs_low_entropy_and_few_mixed_groups():
+    low, normal = [1.0] * 5 + [0.2] * 10, [1.0] * 15
+    mixed, flat = [0.5] * 15, [0.1] * 15
+    assert collapse_stop(low, mixed, mixed_min=0.25) is None  # entropy low, groups still disagree
+    assert collapse_stop(normal, flat, mixed_min=0.25) is None  # no signal, but entropy normal
+    assert collapse_stop(low, flat, mixed_min=0.25) is not None
+    assert collapse_stop(low, [0.1] * 9, mixed_min=0.25) is None  # fewer than 10 steps of fractions
+    assert collapse_stop(low, [0.1] * 14 + [None], mixed_min=0.25) is None
+    assert collapse_stop(low, mixed[:5] + [0.25] * 10, mixed_min=0.25) is None  # 0.25 is the floor
+    assert collapse_stop(low, mixed, mixed_min=None) is not None  # overfit configs: entropy alone
+
+
+def test_mixed_group_condition_is_on_in_production_and_off_in_the_overfit_configs():
+    v1 = rlconfig.load("configs/grpo/v1.json")["stop"]
+    assert (v1["mixed_group_fraction_min"], v1["mixed_group_window"], v1["entropy_collapse_ratio"]) == (0.25, 10, 0.30)
+    assert rlconfig.load("configs/grpo/overfit-local.json")["stop"]["mixed_group_fraction_min"] is None
+    cont = rlconfig.load("configs/grpo/overfit-cont.json")["stop"]
+    assert cont["mixed_group_fraction_min"] is None and cont["entropy_collapse_ratio"] == 0
+
+
+def test_logged_monitors_restore_the_mixed_fractions_on_resume(tmp_path):
+    log = tmp_path / "log.jsonl"
+    recs = [{"type": "step", "format_error_rate_per_tool_call": 0.01, "completion_entropy_mean": 0.5,
+             "non_degenerate_fraction": 0.4},
+            {"type": "eval", "step": 0},
+            {"type": "step", "format_error_rate_per_tool_call": None, "non_degenerate_fraction": None}]
+    log.write_text("".join(json.dumps(r) + "\n" for r in recs))
+    assert logged_monitors(log) == ([0.01, None], [0.5], [0.4, None])
+
+
+def test_a_resumed_run_finds_its_earlier_before_measurement(tmp_path):
+    log = tmp_path / "log.jsonl"
+    assert logged_measure(log, "before") is None
+    recs = [{"type": "measure", "tag": "before", "reward_mean": 0.33}, {"type": "step", "step": 1},
+            {"type": "measure", "tag": "after-step13", "reward_mean": 0.7}]
+    log.write_text("".join(json.dumps(r) + "\n" for r in recs))
+    assert logged_measure(log, "before")["reward_mean"] == 0.33
+    assert logged_measure(log, "after") is None
+
+
+def test_kl_sample_is_fixed_by_seed_and_step_and_not_a_prefix():
+    assert kl_sample(40, 64, 0, 7) == list(range(40))
+    assert kl_sample(40, None, 0, 7) == list(range(40))
+    a = kl_sample(500, 64, 0, 7)
+    assert a == kl_sample(500, 64, 0, 7) and len(a) == len(set(a)) == 64
+    assert a != list(range(64)) and max(a) >= 64
+    assert a != kl_sample(500, 64, 0, 8) and a != kl_sample(500, 64, 1, 7)
+
+
+def test_production_eval_and_kl_follow_revision_3_1():
+    v1 = rlconfig.load("configs/grpo/v1.json")
+    assert v1["eval"]["k"] == 8 and v1["kl"]["max_sequences"] == 64 and v1["kl"]["beta"] == 0.0
 
 
 def write_cfg(tmp_path, **client):

@@ -1,0 +1,9 @@
+{
+  "base": "configs/grpo/overfit-local.json",
+  "note": "Audit revision 3-1 item 2 (diagnostic): resume a copy of runs/grpo-overfit from step 13 to step 30 with the entropy stop off (ratio 0). Every other stop condition stays.",
+  "overrides": {
+    "out_dir": "runs/grpo-overfit-cont",
+    "stop": {"entropy_collapse_ratio": 0},
+    "measure": {"k": 8, "after_tag": "after-step30"}
+  }
+}

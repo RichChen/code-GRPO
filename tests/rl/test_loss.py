@@ -78,6 +78,25 @@ def test_zero_advantage_gives_no_update():
     assert stats["grad_norm"] == 0.0 and all(torch.equal(a, b) for a, b in zip(before, params))
 
 
+def test_kl_uses_the_chosen_sequences_paired_with_their_own_reference():
+    model = tiny_model()
+    params = list(model.parameters())
+    opt = torch.optim.AdamW(params, lr=0.0, weight_decay=0.0)
+    seqs = [Sequence(list(range(1, 5 + n)), 2, [-1.0] * (2 + n), 0.5, n, 0) for n in range(4)]
+    with torch.no_grad():
+        ref = {s.episode: completion_logps(model, s.input_ids, s.start, "cpu") for s in seqs}
+    asked = []
+
+    def ref_logps(s):
+        asked.append(s.episode)
+        return ref[s.episode]
+
+    stats = train_step(model, params, opt, torch.amp.GradScaler("cpu", enabled=False), seqs, 8.0, tis_cap=2.0,
+                       max_grad_norm=1.0, device="cpu", ref_logps=ref_logps, kl_indices=[1, 3])
+    assert asked == [1, 3] and stats["kl_sequences"] == 2
+    assert abs(stats["kl_k3_mean"]) < 1e-6  # each sequence against its own reference: the same weights
+
+
 def _full_logits_step(model, params, opt, scaler, seqs, t_norm, tis_cap, max_grad_norm, device):
     """The pre-change step: one fp32 logit matrix per sequence, entropy before backward."""
     model.train()

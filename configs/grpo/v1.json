@@ -32,8 +32,10 @@
   "max_grad_norm": 1.0,
   "max_completion_tokens_per_episode": 2560,
   "tis": {"enabled": true, "cap": 2.0},
-  "kl": {"beta": 0.0, "max_sequences": null},
-  "eval": {"every": 25, "ids": "data/tasks/dev_ids.txt", "k": 4, "client": "configs/sft/v1-eval.json", "concurrency": 8},
+  "kl": {"beta": 0.0, "max_sequences": 64,
+         "note": "Audit revision 3-1 item 4: the logged KL uses 64 sequences drawn at random with a seed fixed by (seed, step), not the first 64 (those are a few tasks). beta = 0, so this only changes the log."},
+  "eval": {"every": 25, "ids": "data/tasks/dev_ids.txt", "k": 8, "client": "configs/sft/v1-eval.json", "concurrency": 8,
+           "note": "Audit revision 3-1 item 5: K=8 (was 4) for checkpoint selection, step 0 included. Held-out stays K=4."},
   "measure": null,
   "sync_check": {"greedy_tokens": 32, "max_logprob_mad": 0.05},
   "stop": {
@@ -43,6 +45,9 @@
     "format_error_window": 10,
     "entropy_baseline_steps": 5,
     "entropy_collapse_ratio": 0.30,
+    "mixed_group_fraction_min": 0.25,
+    "mixed_group_window": 10,
+    "mixed_group_note": "Audit revision 3-1 item 3: low entropy stops the run only if the mean fraction of groups with both successes and failures over the last 10 steps is also below 0.25.",
     "dev_gain_check_step": 100
   },
   "vllm": {
