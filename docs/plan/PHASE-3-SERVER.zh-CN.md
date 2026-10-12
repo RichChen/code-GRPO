@@ -1,0 +1,105 @@
+# 阶段 3：A800 上的 GRPO 训练与留出集评测
+
+> 执行方：服务器上的 Cursor agent，在 `/home/arl/work/agentic-rl` 里工作，身份是 `arl` 用户。审计方：Claude Code（本地）。
+> 这台机器按小时计费，所以每一步都有明确的通过标准和停止条件，不要在不确定的状态下让 GPU 空转。
+
+## 0. 机器现状（审计方已准备好，不用重做）
+
+- **硬件**：A800-SXM4-40GB，驱动 595.84，CUDA 13.2，16 核，31 GiB 内存，磁盘可用 159 GB，Ubuntu 24.04，内核 7.0.0。驱动满足 `setup.sh` 要求的 CUDA 13.0 以上，**不用备用环境**。
+- **代码**：`/home/arl/work/agentic-rl`，在提交 `a107482`，和本地一致。origin 指向 GitHub，但仓库是私有的、服务器上没有凭据，所以 `git pull` 和 `git push` 都不可用。代码的同步由审计方用 bundle 完成。
+- **已传好的文件**（sha256 已校验）：`data/tasks/train.jsonl`、`heldout.jsonl`、`runs/sft-v1/adapter/`。题号文件在 git 里。**没有传 `.env`**，本阶段不调用付费 API。
+- **已装好**：git、curl、rsync、uv 0.13.0，以及主项目依赖（`uv sync --frozen`）。**torch 和 vLLM 还没装**，由 `setup.sh` 安装。
+- **身份**：必须用 `arl` 用户，不要用 root。root 会绕过进程数限制，防 fork 炸弹的 2 项测试会失败。
+- **bwrap**：可用。审计方已加 AppArmor 配置 `/etc/apparmor.d/bwrap-userns`，允许 bwrap 创建用户命名空间。已验证：`tests/test_sandbox.py` 25 项全通过、0 跳过；`uv run pytest -q` 281 项通过、7 项跳过（跳过的都是等模型下载后才能跑的）。
+- **SFT-v1 已核对**：服务器上 `runs/sft-v1/adapter/` 三个文件的 sha256 和 `configs/sft/v1.json` 的记录、以及本地的值三方一致（`adapter_model.safetensors` 为 `7365aa36…`，69782384 字节）。第 1 步仍要自己复核一遍，并检查权重里有没有 NaN 或 inf。
+
+## 1. 规则
+
+- 之前的规则全部有效：每一步做完跑全量测试、提交 git（只在本地提交，不要 push）、写 PROGRESS；遇到"停下报告"不得自行降低要求、不得自行改超参数或算法。
+- **GPU 一次只跑一件事。** 每一步结束后确认显存已释放（`nvidia-smi` 显示接近 0），再开始下一步。
+- **留出集只在第 5 步按预注册跑一次。** 第 1 到 4 步不得读取 `heldout.jsonl` 做任何评测。
+- **不调用付费 API。**
+- 长时间任务放到 `tmux` 或 `nohup` 里跑，断线不影响。每一步的日志都要落盘到 `runs/` 下。
+- 新定门槛要遵守修订 2C-2 第 4 条：会随轮数或长度增长的指标，先换算成每次调用或每个 token 的口径。
+
+## 2. 分步计划
+
+### 第 1 步：装环境、自检、核对 SFT-v1
+
+1. `scripts/server/setup.sh`。装 torch 2.13.0+cu130、vLLM 0.31.0，下载基座快照 `70d244cc86cc`。
+   - 下载慢的话可以设 `HF_ENDPOINT=https://hf-mirror.com`（已测通），用了就写进 PROGRESS。
+2. `scripts/server/selfcheck.sh`。必须全部通过，**13 项 bwrap 检查一项都不能跳过**。
+3. **核对 SFT-v1**：算 `runs/sft-v1/adapter/` 里各文件的 sha256，和 `configs/sft/v1.json` 比对。
+   - 不一致就停下报告，贴出两边的值和文件大小，不要自行更新 json 里的记录。
+   - 适配器的权重张量要逐一检查有没有 NaN 或 inf，有就停下。
+4. 提交，报告：各步耗时、磁盘占用、测试结果。
+
+### 第 2 步：合并 fp16 并核对 dev 基线
+
+1. `scripts/server/merge_fp16.sh`。把 SFT-v1 合并进以 fp16 加载的基座，vLLM 用 `--dtype half` 服务，在 dev 集上用 token 客户端评测，K=4、temperature 0.8、top_k 20。
+2. **通过标准**：严格解出率落在 [45.5%, 61.25%] 内（本地 53.5% 的 95% 区间）。不在区间内就停下报告，不要重跑碰运气，也不要改评测参数。
+3. 报告：严格口径和非 generated 口径的解出率、每次调用的格式错误率、平均轮数、停止原因分布，并和本地 53.5%、55.25% 这两个数对比。
+4. 提交。
+
+### 第 3 步：GRPO 过拟合测试（本地没跑成，这里是第一次真跑）
+
+这一项是正式训练的前置条件。本地因为显存不够没能跑起来，这里要先跑通。
+
+1. **先探测显存模式**：跑 `scripts/server/bench.sh` 的 probe 部分，确认 sleep level 1 和 2 能不能用、训练端和 vLLM 能不能同时驻留（colocate）。
+   - 40 GB 下 colocate 应该放得下：vLLM 约 10 GB、训练端约 11 GB。能 colocate 就用它，每步能省掉 sleep 和 wake 的时间。
+   - `configs/grpo/v1.json` 里的 `cuda_memory_limit_gib` 现在是 10.0，这是为 11 GB 的本地卡设的。按 colocate 的实测占用把它调到一个合适的值，比如 16.0，并说明依据。这是放宽本地的限制，不是改算法超参数。
+   - `vllm.gpu_memory_utilization` 现在是 0.85。colocate 模式下要调低，让训练端有空间，建议从 0.45 起试。实际用的值和依据写进 PROGRESS。
+2. **跑过拟合测试**：`configs/grpo/overfit-local.json`，8 题、30 步、lr 5e-5，`memory_mode` 用第 1 小步定下来的模式。
+3. **通过标准**（和原计划一致）：训练后在这 8 题上 K=8、T=1.0 的平均奖励，比训练前至少高 0.15。
+4. **停止条件**，触发任何一条就停下报告，不要改学习率或算法：
+   - 奖励没有上升；
+   - 出现 NaN；
+   - logprob 差异均值大于 0.05；
+   - 权重同步后贪心生成或 logprob 和训练端不一致；
+   - 熵掉到前 5 步均值的 30% 以下。
+5. 报告：奖励曲线、熵曲线、每次调用的格式错误率曲线、每一步按阶段分的耗时（采样、sleep 或 wake、训练、同步）、显存峰值、`max_logprob_diff` 的均值和 p99。
+6. 提交。
+
+### 第 4 步：正式 GRPO 训练
+
+1. **先跑 3 步测速**：用 `bench.sh` 的后半部分，按实测步时估算 200 步要多久，写进 PROGRESS。
+   - 估算超过 20 小时，就先停下报告，等审计方决定是减少步数还是调小 `n_tasks`。不要自行改配置。
+2. **正式训练**：`configs/grpo/v1.json`，1018 题、200 步、`n_tasks` 16、`group_size` 8、lr 1e-5、T=1.0、top_k 0。每 25 步在 dev 集上评测一次并保存检查点。
+   - 放在 tmux 里跑，要能断点续跑。
+   - **每过约 2 小时在 PROGRESS 里追加一次简报**：步数、平均奖励、非全对全错组的比例、熵、格式错误率、logprob 差异、dev 评测结果。这样审计方中途也能判断要不要继续。
+3. **停止条件**（配置里已有，触发就停）：连续 10 步格式错误率超过 10%；熵坍缩；logprob 差异均值超过 0.05；跳过的步数超过 3。
+   - 另外加一条：如果到第 100 步，dev 严格解出率仍然没有超过第 0 步的基线，就停下报告。
+4. **选检查点**：按 `HELDOUT-PREREG` 的规定，只看 dev 严格解出率，取最高；相差不到 1 个百分点时取步数更早的那个。选的理由和各检查点的 dev 结果都要写出来。
+5. 提交。
+
+### 第 5 步：留出集评测（只跑一次）
+
+1. 严格按 `docs/plan/HELDOUT-PREREG.zh-CN.md` 执行，**开始前先完整读一遍，并在 PROGRESS 里逐条确认**。
+2. 三个模型：基座 Qwen3-1.7B（fp16 加载）、SFT-v1（第 2 步的 `merged-fp16`）、GRPO 选定的检查点（先合并成 fp16，不用运行时 LoRA）。
+3. 1500 题、每题 K=4、temperature 0.8、top_k 20、环境 `phase1-env-v1`、token 客户端。**每个模型只跑一次，不重跑。**
+4. 统计照预注册：按 bug 来源函数做聚类 bootstrap，10000 次，seed 0。报告 GRPO 减 SFT、SFT 减基座这两组配对差值和 95% 置信区间。
+5. 提交。
+
+### 第 6 步：CHECKPOINT-3
+
+写 `docs/plan/CHECKPOINT-3.md`，内容包括：
+
+- 第 1 到 5 步各自的结论；
+- GRPO 的训练曲线：奖励、熵、格式错误率、非全对全错组比例、logprob 差异；
+- 各检查点的 dev 结果，以及选谁、为什么；
+- 留出集的三方对比表和配对置信区间；
+- 预注册里的已知局限，逐条说明实际影响；
+- 机器用了多久、花了多少钱；
+- 遇到的问题。
+
+写完停下。**不要删除服务器上的任何 `runs/` 数据**，等审计方把结果拉回本地。
+
+## 3. 不要做的事
+
+- 不要用 root 跑任何训练或测试。
+- 不要在第 1 到 4 步读 `heldout.jsonl` 做评测，留出集只在第 5 步跑一次。
+- 不要改冻结的题集、环境行为和奖励。
+- 不要改学习率、`n_tasks`、`group_size`、温度、top_k、LoRA 配置。显存相关的 `cuda_memory_limit_gib` 和 `gpu_memory_utilization` 可以按第 3 步的要求调整。
+- 不要调用付费 API。
+- 不要 `git push`，也不要试着配置 GitHub 凭据。
+- 遇到停止条件就停下写报告，不要自行换方案。
