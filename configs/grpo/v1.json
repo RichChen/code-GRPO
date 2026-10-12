@@ -13,7 +13,8 @@
   },
   "adapter_dtype": "float32",
   "gradient_checkpointing": true,
-  "cuda_memory_limit_gib": 10.0,
+  "cuda_memory_limit_gib": 16.0,
+  "memory_note": "Phase 3 step 3 (A800 40GB, runs/server-bench/colocate-probe): trainer and vLLM colocate. Worst-case training sequence (8192 tokens, 1024 completion) peaks at 6.03 GiB allocated / 6.33 reserved next to vLLM at 0.45 (KV cache 120,080 tokens), card peak 25.3 GB. 16 GiB is about 2.5x that peak; 0.45 x 39.5 GiB + 16 GiB stays under the card. 10.0 was the local 11 GB card.",
   "tasks": "data/tasks/grpo_v1_ids.txt",
   "task_sample": null,
   "task_sample_seed": 0,
@@ -41,17 +42,18 @@
     "format_error_rate_per_call": 0.10,
     "format_error_window": 10,
     "entropy_baseline_steps": 5,
-    "entropy_collapse_ratio": 0.30
+    "entropy_collapse_ratio": 0.30,
+    "dev_gain_check_step": 100
   },
   "vllm": {
     "dtype": "half",
     "max_model_len": 8192,
-    "gpu_memory_utilization": 0.85,
+    "gpu_memory_utilization": 0.45,
     "port": 8000,
     "max_lora_rank": 16,
     "max_loras": 1,
     "seed": 0,
-    "memory_mode": "sleep",
+    "memory_mode": "colocate",
     "sleep_level": 2,
     "startup_timeout_s": 900
   },

@@ -11,6 +11,6 @@
     "eval": {"every": 0},
     "measure": {"k": 8},
     "out_dir": "runs/grpo-overfit",
-    "vllm": {"memory_mode": "sleep"}
+    "vllm": {"memory_mode": "colocate"}
   }
 }

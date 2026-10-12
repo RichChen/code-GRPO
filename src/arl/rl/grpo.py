@@ -89,6 +89,23 @@ def entropy_collapse_stop(entropies: list[float], baseline_steps: int = 5, ratio
     return None
 
 
+def dev_gain_stop(log_path: Path, step: int, check_step: int | None) -> str | None:
+    """At ``check_step``, stop unless the dev strict solve rate is above the step-0 baseline in ``log.jsonl``."""
+    if not check_step or step != check_step:
+        return None
+    evals = {}
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            rec = json.loads(line)
+            if rec.get("type") == "eval":
+                evals[rec["step"]] = rec["solve_rate_strict"]
+    if 0 not in evals or step not in evals:
+        return f"dev check at step {step} needs the step-0 and step-{step} evals; have steps {sorted(evals)}"
+    if evals[step] <= evals[0]:
+        return f"dev strict solve rate at step {step} is {evals[step]}, not above the step-0 baseline {evals[0]}"
+    return None
+
+
 def logged_monitors(path: Path) -> tuple[list[float | None], list[float]]:
     """Per-step format-error rates and entropies already written to ``log.jsonl`` (for resume)."""
     rates: list[float | None] = []
@@ -312,12 +329,19 @@ class Run:
                 result["before"] = measure([self.tasks[i] for i in self.ids], m["k"], self.client, self.adapter[0],
                                            cfg, "before")
                 self.record({"type": "measure", **result["before"]})
+            ev = cfg["eval"]
+            # The step-0 baseline (SFT-v1 through runtime LoRA) for the "no gain by step 100" stop condition.
+            if ev.get("every") and self.step == 0 and not (self.out / "eval" / "step-0.jsonl").exists():
+                self.record({"type": "eval", **evaluate(cfg, self.adapter[0], self.out, 0)})
             while self.step < cfg["steps"]:
                 self.one_step()
                 ev = cfg["eval"]
                 if ev.get("every") and self.step % ev["every"] == 0:
                     rec = evaluate(cfg, self.adapter[0], self.out, self.step)
                     self.record({"type": "eval", **rec})
+                    reason = dev_gain_stop(self.log_path, self.step, cfg["stop"].get("dev_gain_check_step"))
+                    if reason:
+                        raise Stop(reason)
             if m:
                 result["after"] = measure([self.tasks[i] for i in self.ids], m["k"], self.client, self.adapter[0],
                                           cfg, "after")

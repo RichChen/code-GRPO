@@ -1083,3 +1083,8 @@ CHECKPOINT-2A 审计通过。审计修订 2A-2 补在 `PHASE-2-SFT.zh-CN.md` 末
 - 按 bug 类型的严格解出率：arith_swap 69.7%、bool_swap 25.0%、compare_swap 65.0%、const_off_by_one 32.4%、remove_branch 47.7%、var_swap 68.5%。完整报告 `runs/phase3/step2-dev-report.json`。
 - 吞吐是本地的约 6 倍（单 episode 平均 4.43 秒，并发 8）。按这个速度，留出集每个模型 6000 个 episode 大约要 1.1 小时。
 - 测试：uv 282 passed、6 skipped；vLLM 环境 295 passed、2 skipped；train 环境 tests/train tests/rl 42 passed、1 skipped。
+
+## 第 3 步：GRPO 过拟合测试
+
+- 预计耗时：探测约 15 分钟，过拟合 30 步 1–1.5 小时。
+- **超出预期（15:50 记）**：过拟合第 1 步用了 239 秒，其中采样 39 秒、训练 197 秒。每步约 93 万个序列 token（每一轮单独一条序列，带完整 prompt），30 步约 2 小时。正式配置每步 128 个 episode，粗算单步约 8 分钟、200 步约 26 小时，可能超过 20 小时门槛。按计划到第 4 步测速后再判断，现在不改任何训练设置。

@@ -5,7 +5,7 @@ import pytest
 
 from arl.rl import config as rlconfig
 from arl.rl.batch import Episode, Turn, batch_stats, group_advantages, sequences, t_norm, turn_from_record
-from arl.rl.grpo import entropy_collapse_stop, format_rate_stop, step_task_ids, training_ids
+from arl.rl.grpo import dev_gain_stop, entropy_collapse_stop, format_rate_stop, step_task_ids, training_ids
 from arl.rl.rollout import collect, episode_seed
 from arl.rollout.client import ClientConfig
 
@@ -197,3 +197,22 @@ def test_collect_runs_groups_and_keeps_the_token_turns(task):
     assert all(len(e.turns) == 2 and e.turns[1].completion_ids == [2, 151645] for e in eps)
     assert {m for m, _, _ in made} == {"step-4"} and len({s for _, s, _ in made}) == 3
     assert episode_seed(0, 4, task.task_id, 0) != episode_seed(0, 5, task.task_id, 0)
+
+
+def test_dev_gain_stop_compares_step_100_with_step_0(tmp_path):
+    log = tmp_path / "log.jsonl"
+    evals = [{"type": "eval", "step": 0, "solve_rate_strict": 0.55}, {"type": "step", "step": 1},
+             {"type": "eval", "step": 25, "solve_rate_strict": 0.5}, {"type": "eval", "step": 100, "solve_rate_strict": 0.55}]
+
+    def write(recs):
+        log.write_text("".join(json.dumps(e) + "\n" for e in recs))
+
+    write(evals)
+    assert dev_gain_stop(log, 25, 100) is None
+    assert dev_gain_stop(log, 100, None) is None
+    assert "not above" in dev_gain_stop(log, 100, 100)  # equal is not a gain
+    evals[-1]["solve_rate_strict"] = 0.5525
+    write(evals)
+    assert dev_gain_stop(log, 100, 100) is None
+    write(evals[-1:])
+    assert "needs the step-0" in dev_gain_stop(log, 100, 100)
