@@ -1029,3 +1029,32 @@ CHECKPOINT-2A 审计通过。审计修订 2A-2 补在 `PHASE-2-SFT.zh-CN.md` 末
 - `uv run pytest -q` → 277 passed，5 skipped；
 - `~/.venvs/vllm` 全量 → 287 passed，2 skipped；
 - `~/.venvs/train` 里跑 `tests/train`、`tests/rl`、`tests/test_tokenclient.py`、`tests/test_hermes.py` → 52 passed，3 skipped。
+
+# 阶段 3：A800 上的 GRPO 训练与留出集评测
+
+- 机器：A800-SXM4-40GB，驱动 595.84（CUDA 13.2），16 核，31 GiB 内存。2026-10-12 13:26 开工。
+- 所有命令以 `arl` 身份执行（agent 的 shell 是 root，统一用 `su - arl -c` 切换）。git 提交用仓库级身份 `arl (A800 server agent) <arl@ubuntu24>`，只在本地提交，不 push。
+- 服务器上没有 tmux，长任务用 `setsid nohup` 放后台，日志落在 `runs/` 下。
+
+## 第 1 步：装环境、自检、核对 SFT-v1
+
+- 预计耗时：`setup.sh` 15–30 分钟，`selfcheck.sh` 约 10 分钟。
+- huggingface.co 连不上（10 秒超时），hf-mirror.com 正常，所以 `setup.sh` 用 `HF_ENDPOINT=https://hf-mirror.com` 运行。PyPI 可以直连。
+- **超出预期（13:56 记）**：`setup.sh` 开始于 13:27，到 13:56 还在装 vLLM 环境。PyPI 下载约 7 MB/s，训练环境的 wheel 约 4.7 GB。继续等，不换源。
+- `setup.sh` 里环境部分全部通过：`train torch 2.13.0+cu130 cuda 13.0`，`vllm 0.31.0 torch 2.13.0+cu130 cuda 13.0`。
+- **基座权重下载卡住（14:33 记）**：hf-mirror 把两个 safetensors 302 到 `cas-bridge.xethub.hf.co`，实测约 85 KB/s，读超时反复重试，9 分钟只下了 66 MB。小文件（config、tokenizer 等）已进缓存。停掉了 `hf download`，`setup.sh` 退出码 143。
+  - 试过从 ModelScope 分段并行下载（约 4.6 MB/s，`scripts/server/fetch_base_modelscope.sh`，按 hf-mirror 返回的 `X-Linked-ETag` 校验 sha256 后才入缓存）。ModelScope 列出的 sha256 和 HF 快照一致：`model-00001` 为 `169ad53e…30ed5`（3441185608 字节），`model-00002` 为 `912becff…deff9`（622329984 字节）。
+  - 14:36 按用户指示停下，等用户手动上传权重。ModelScope 的半截临时文件已删除，没有任何文件进入 HF 缓存的 blobs。
+  - **15:00 用户手动上传了权重**到 `~/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/`。核对结果：两个 safetensors 的 sha256 等于 HF 快照的 LFS 值（见上）；其余 10 个小文件的 git blob 哈希等于各自的 blob 文件名；`refs/main` 指向 `70d244cc86cc`；`HF_HUB_OFFLINE=1 hf download --revision 70d244cc…` 12/12 个文件都解析到；index 列出的 311 个张量都在，全是 bf16。半截的 `*.incomplete` 已不在。`fetch_base_modelscope.sh` 没有用上，留在仓库里备查。
+- **`selfcheck.sh` 第一次失败（15:01–15:05）**：bwrap 和前三组测试都过了，`~/.venvs/train` 里 `test_sft_train.py` 两项 GPU 测试失败。原因是 triton 运行时用 gcc 编译 `cuda_utils.c` 时找不到 `Python.h`：`uv venv --python 3.12` 用的是系统 `/usr/bin/python3.12`，机器上没装 `python3.12-dev`。正式训练的 GradScaler 也走这条路径，必须修。日志在 `runs/phase3/selfcheck-attempt1.log`。
+  - 处理：用 root 执行 `apt-get install python3.12-dev`（3.12.3-1ubuntu0.17），只装系统头文件，torch、vLLM 和两个 venv 都没动。
+- **`selfcheck.sh` 重跑通过（15:06–15:10，3 分 49 秒）**，日志 `runs/phase3/selfcheck.log`：
+  - `bwrap ok`；`tests/test_sandbox.py` **25 passed、0 skipped**，13 项 bwrap 检查全部执行；
+  - `uv run pytest -q` 282 passed、6 skipped；
+  - `~/.venvs/vllm` 全量 295 passed、2 skipped；
+  - `~/.venvs/train` 的 `tests/train tests/rl` 42 passed、1 skipped；
+  - GPU：A800-SXM4-40GB，39.5 GiB，bf16 可用。
+  - 跳过的原因逐条看过，都是“该环境没装 torch / peft / transformers / vllm”，对应测试在另一个环境里跑过。
+- **耗时**：`setup.sh` 的环境部分 13:27–14:23（约 56 分钟，主要是 PyPI 下载）；基座下载卡住加等待上传 14:23–15:00；自检两次共约 8 分钟。第 1 步墙钟合计约 1 小时 45 分钟。
+- **磁盘**：根分区已用 42G、可用 145G。`~/.venvs/train` 4.7G，`~/.venvs/vllm` 3.4G，`~/.cache/huggingface` 3.8G。
+- **SFT-v1 核对通过**（`scripts/server/check_sft_v1.py`，结果 `runs/phase3/sft-v1-check.json`）：三个文件的 sha256 和 `configs/sft/v1.json` 一致，`adapter_model.safetensors` 69782384 字节；392 个张量全是 fp32，共 17,432,576 个元素，没有 NaN 或 inf，绝对值最大 0.0391。
