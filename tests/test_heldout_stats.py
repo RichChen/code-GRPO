@@ -8,12 +8,12 @@ def rec(task, reward, non_gen=None):
 
 
 def test_cluster_bootstrap_keeps_whole_clusters():
-    # Two clusters with constant values: every resample mean is a task-weighted mix of 0 and 1.
+    # Two clusters with constant values: every resample mean is a mix of 0 and 1 weighted by task count.
     values = {"a1": 1.0, "a2": 1.0, "a3": 1.0, "b1": 0.0}
     cluster_of = {"a1": "A", "a2": "A", "a3": "A", "b1": "B"}
     mean, lo, hi = cluster_bootstrap(values, cluster_of, n=2000, seed=0)
     assert mean == 0.75
-    # Possible resample means: {A,A} -> 1, {A,B} -> 3/4, {B,B} -> 0. A task-level bootstrap would give others.
+    # Possible resample means: {A,A} -> 1, {A,B} -> 3/4, {B,B} -> 0. Resampling single tasks would give others.
     assert lo == 0.0 and hi == 1.0
 
 
