@@ -9,23 +9,29 @@ the value printed in CHECKPOINT-3 ("结论" and "留出集三方对比"), a few 
 matches when it equals the reported one after rounding to the reported precision; values exactly half a unit away
 (binary float rounding ties such as 3.55 printed as 3.5) count as matches and are listed under ``half_unit_ties``.
 Exit 1 on any mismatch. No model calls, no new analysis: only numbers that were already reported.
+
+Also writes ``heldout-tables.md`` next to ``--out``: the three-model and paired tables for the final report, from
+exact values rounded once, half up (at the ties this can differ from CHECKPOINT-3 in the last digit).
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import math
 import statistics
 import sys
 from collections import Counter, defaultdict
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
 from arl.env.task import load_tasks
-from arl.rl.heldout import compare, paired
+from arl.rl.heldout import cluster_bootstrap, compare, paired, per_task_rates
 from arl.rollout.calibrate import latest, load_records
 
 MODELS = ("base", "sft", "grpo")
+K = 4
 HELDOUT_SHA256 = "d28e0709bb81af8196837efaec77ed3833d952ea25fcc1d457aa87f15d7cc3d4"
 CP3 = "docs/plan/CHECKPOINT-3.md"
 TABLE = f"{CP3} 留出集三方对比"
@@ -98,6 +104,69 @@ class Checks:
     @property
     def ties(self) -> list[dict[str, Any]]:
         return [c for c in self.items if c["half_unit_tie"]]
+
+
+def round_half_up(x: Fraction, decimals: int) -> str:
+    """``x`` rounded once, half away from zero, printed with ``decimals`` places."""
+    sign, x = ("-", -x) if x < 0 else ("", x)
+    n = math.floor(x * 10 ** decimals + Fraction(1, 2))
+    if decimals == 0:
+        return f"{sign}{n}"
+    return f"{sign}{n // 10 ** decimals}.{n % 10 ** decimals:0{decimals}d}"
+
+
+def heldout_tables(runs: dict[str, list[dict[str, Any]]], tasks: dict[str, Any]) -> str:
+    """The three-model table and the paired table for the final report, from exact values rounded once."""
+    def pct(num: int, den: int, dec: int = 1) -> str:
+        return round_half_up(Fraction(100 * num, den), dec) + "%"
+
+    rows: list[tuple[str, list[str]]] = []
+
+    def row(label: str, f: Any) -> None:
+        rows.append((label, [f(runs[m]) for m in MODELS]))
+
+    row("**严格解出率**", lambda rs: "**" + pct(sum(r["reward"] for r in rs), len(rs)) + "**")
+    row("test+challenge", lambda rs: pct(sum(int(bool(r["grade"].get("pass_non_generated"))) for r in rs), len(rs)))
+    for key in REPORTED_PCT:
+        if key.startswith(("bug_type/", "origin/")):
+            kind, name = key.split("/")
+            label = {"mbpp": "MBPP", "humaneval": "HumanEval"}.get(name, name)
+
+            def f(rs: list[dict[str, Any]], kind: str = kind, name: str = name) -> str:
+                sel = [r["reward"] for r in rs if (tasks[r["task_id"]].meta["bug_type"] if kind == "bug_type"
+                                                   else tasks[r["task_id"]].meta["bug_source"].split("/")[0]) == name]
+                return pct(sum(sel), len(sel))
+            row(label, f)
+    row("每次调用格式错误率", lambda rs: pct(sum(r["format_errors"] for r in rs), sum(r["n_tool_calls"] for r in rs)))
+    row("出错 episode 比例（只报告）", lambda rs: pct(sum(1 for r in rs if r["format_errors"]), len(rs)))
+    row("平均轮数", lambda rs: round_half_up(Fraction(sum(r["turns"] for r in rs), len(rs)), 2))
+
+    def solved_k(rs: list[dict[str, Any]], want: int) -> str:
+        per: dict[str, int] = defaultdict(int)
+        for r in rs:
+            per[r["task_id"]] += r["reward"]
+        return str(sum(1 for v in per.values() if v == want))
+    row("每题 4 次全部解出", lambda rs: solved_k(rs, 4))
+    row("每题 4 次都没解出", lambda rs: solved_k(rs, 0))
+
+    lines = ["| | 基座 | SFT-v1 | GRPO（第 150 步） |", "|---|---|---|---|"]
+    lines += [f"| {label} | " + " | ".join(cells) + " |" for label, cells in rows]
+    lines += ["", "| 配对差值（273 簇，10000 次，seed 0） | 严格 | 95% CI | test+challenge | 95% CI | 变好 / 变差的题 |",
+              "|---|---|---|---|---|---|"]
+    for x, y, label in (("grpo", "sft", "GRPO − SFT"), ("sft", "base", "SFT − 基座")):
+        cells = []
+        for key in ("reward", "non_generated"):
+            ra, rb = per_task_rates(runs[x], key), per_task_rates(runs[y], key)
+            diffs = {t: ra[t] - rb[t] for t in ra}
+            exact = sum((Fraction(ra[t]).limit_denominator(K) - Fraction(rb[t]).limit_denominator(K)) for t in ra) / len(ra)
+            _, lo, hi = cluster_bootstrap(diffs, {t: tasks[t].meta["bug_source"] for t in diffs})
+            cells += [f"{'+' if exact > 0 else ''}{round_half_up(100 * exact, 1)}",
+                      f"[{round_half_up(Fraction(100 * lo), 1)}, {round_half_up(Fraction(100 * hi), 1)}]"]
+            if key == "reward":
+                better = sum(1 for d in diffs.values() if d > 0)
+                worse = sum(1 for d in diffs.values() if d < 0)
+        lines.append(f"| {label} | " + " | ".join(cells) + f" | {better} / {worse} |")
+    return "\n".join(lines) + "\n"
 
 
 def recount(recs: list[dict[str, Any]], tasks: dict[str, Any]) -> dict[str, Any]:
@@ -236,8 +305,14 @@ def main(argv: list[str] | None = None) -> int:
                           for m in MODELS},
               "paired": pairs, "gains_grpo_minus_sft_points": {k: round(v, 2) for k, v in gains.items()},
               "items": c.items}
+    tables = heldout_tables(runs, tasks)
+    result["tables_markdown"] = tables
     a.out.parent.mkdir(parents=True, exist_ok=True)
     a.out.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    (a.out.parent / "heldout-tables.md").write_text(
+        "<!-- generated by scripts/closeout/verify_heldout.py: exact values rounded once -->\n\n" + tables,
+        encoding="utf-8")
+    print(tables)
     for it in c.items:
         print(("ok   " if it["ok"] else "FAIL ") + f"{it['item']}: computed {it['computed']!r} reported {it['reported']!r}")
     print(f"{len(c.items)} checks, {len(c.failed)} failed, {len(c.ties)} on a half-unit tie -> {a.out}")

@@ -34,3 +34,17 @@ def test_rounding_match_and_half_unit_tie():
     assert vt.matches(0.6675, 0.668, 3) and vt.on_tie(0.6675, 0.668, 3)
     assert not vt.on_tie(0.6674, 0.667, 3)
     assert vt.step_value({"reward_mean": 0.4922, "episodes": 128}, "reward_mean") == 63 / 128
+
+
+def test_round_half_up_rounds_once_from_the_exact_value():
+    from fractions import Fraction
+
+    vt = load("verify_training")
+    assert vt.round_half_up(Fraction(2136, 3200), 3) == "0.668"
+    assert vt.round_half_up(Fraction("2.0492"), 1) == "2.0"
+    assert vt.round_half_up(Fraction("0.845"), 2) == "0.85"
+    assert vt.round_half_up(Fraction("0.0007190"), 4) == "0.0007"
+    assert vt.round_half_up(Fraction("398.412"), 0) == "398"
+    vh = load("verify_heldout")
+    assert vh.round_half_up(Fraction(213 * 100, 6000), 1) == "3.6"
+    assert vh.round_half_up(Fraction(-1, 8), 2) == "-0.13"

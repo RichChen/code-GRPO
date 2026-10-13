@@ -1578,3 +1578,52 @@ dev 集 100 题，K=8，800 个 episode，运行时 LoRA：
 - `uv run pytest -q` → 295 passed，6 skipped；
 - `~/.venvs/vllm` 全量（`PYTHONPATH=src`）→ 309 passed，2 skipped；
 - `~/.venvs/train` 里跑 `tests/train tests/rl` → 50 passed，1 skipped。
+
+## 审计修订 4-1：两处加勘误，其余照常
+
+- 修订原文逐字追加到 `PHASE-4-CLOSEOUT.zh-CN.md` 末尾，和第二轮 prompt 一起单独提交（`0a2f398`）。
+- **规则放宽**：计划第 1 节"不改 CHECKPOINT-3"按修订第 1 条放宽，只允许在 `CHECKPOINT-3.md` 末尾追加勘误节，其他内容一律不动。PROGRESS 的原句同样不改，只在"正式训练结束"一节末尾加一行指向勘误。
+- 勘误单独提交（`5280f05`）：
+  - `CHECKPOINT-3.md` 末尾加"勘误（阶段 4 复核，2026-10-13）"。76–100 段每次调用格式错误率 2.1% → 2.0%；第 195 步的 10 步窗口里有好有坏的组的均值，约 0.66 → 0.625。写明了原文、正确值、原因、`verify-training.json` 里的字段名，以及不影响结论。正文 171 行没动。
+  - PROGRESS"正式训练结束"一节末尾加了"勘误见 CHECKPOINT-3 末尾"。
+- 恰好差半个单位的 14 处（留出集 10 处、训练 4 处）按修订第 4 条不算错误，不加勘误，在最终报告的"复现"一节说明。
+
+## 第 2 步：最终报告 `docs/FINAL-REPORT.zh-CN.md`
+
+### 先让复核脚本生成报告用的表
+
+按修订第 3 条，报告里的表不从 CHECKPOINT-3 正文抄，由复核脚本从精确值只取整一次生成，恰好一半时进位。
+
+- `verify_training.py`：
+  - `ERRATA` 里的两项改为和勘误后的值比对，原来印的值留在 `reported_before_erratum`；
+  - 生成训练曲线表和 dev 表，写到 `runs/closeout/training-tables.md`，JSON 里也有 `tables_markdown` 和 `corrected_by_erratum`。
+  - 结果：160 项检查，0 项失败，2 项按勘误比对，4 项恰好差半个单位，选出第 150 步。
+  - 生成的训练曲线表和 CHECKPOINT-3 只差 76–100 段格式错误率那一格（2.0%）。
+- `verify_heldout.py`：
+  - 生成三模型对比表和配对差值表，写到 `runs/closeout/heldout-tables.md`。
+  - 配对差的点估计用分数精确计算，区间端点来自 `cluster_bootstrap`。
+  - 结果：150 项检查，0 项失败，10 项恰好差半个单位。
+  - 生成的表和 CHECKPOINT-3 有三格末位不同，都是恰好一半的值按进位处理：基座出错 episode 比例 3.6%（CHECKPOINT-3 写 3.5%），SFT bool_swap 31.3%（31.2%），SFT 平均轮数 6.85（6.84）。其余全部相同。
+- `tests/test_closeout.py` 加了取整函数的测试：0.6675 → 0.668、2.0492 → 2.0、0.845 → 0.85、3.55 → 3.6、负数。
+
+### 报告
+
+- 写之前重读了 `CHECKPOINT-1D.md`、`CHECKPOINT-2A.md`、`CHECKPOINT-3.md`、`HELDOUT-PREREG.zh-CN.md` 和 PROGRESS。A5 的结论只读引用 `/mnt/d/crq/src/coding-agent/docs/A5-FINAL-REPORT.zh-CN.md` 第 1 节，没有改 coding-harness 和 coding-agent。
+- 按计划的十节结构：
+  - 摘要 6 行；
+  - 背景和动机，写明本项目训练的是通用的修 bug 行为，不是 A5 的记忆行为；
+  - 环境和题集；
+  - 训练流程，包括诊断扫描的关键列、SFT、GRPO 题集和算法要点；
+  - 结果，包括留出集两张表、按类型和来源、训练曲线、dev 和选择规则；
+  - 8 个问题，计划要求的 8 个都在；
+  - 局限：预注册 6 条原文照抄，加上实际影响，另补 6 条；
+  - 复现，包括取整说明、14 处半单位、命令表；
+  - 花费：API 合计约 13.30 元，本地有记录的 GPU 时间约 12.4 小时，A800 约 28.5 小时；
+  - 文档索引。
+- 训练曲线表下加了修订要求的脚注原文。复现一节加了修订第 4 条的说明，并逐个列出和 CHECKPOINT-3 末位不同的三格。
+- 每个数字后面都写了出处：文件路径加节名，或者 `verify-*.json` 的字段名。
+
+测试结果：
+- `uv run pytest -q` → 296 passed，6 skipped（多出的 1 个是取整测试）；
+- `~/.venvs/vllm` 全量 → 310 passed，2 skipped；
+- `~/.venvs/train` 里跑 `tests/train tests/rl` → 50 passed，1 skipped。

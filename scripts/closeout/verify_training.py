@@ -14,18 +14,24 @@ Reads ``runs/grpo-v1/log.jsonl``, ``runs/grpo-v1/eval/step-*.jsonl``, ``data/tas
 
 A number matches when it equals the reported one after rounding to the reported precision; values exactly half a
 unit away count as matches and are listed under ``half_unit_ties``. Segment means are plain means of the per-step
-values (the per-step reward restored exactly from its 0/1 count). Exit 1 on any mismatch; ``diagnostics`` gives
-other readings of the numbers that do not match.
+values (the per-step reward restored exactly from its 0/1 count). The two values corrected in the erratum at the end
+of CHECKPOINT-3 (audit revision 4-1) are checked against the corrected value; the original is kept in the record and
+``diagnostics`` gives the other readings. Exit 1 on any mismatch.
+
+Also writes ``training-tables.md`` next to ``--out``: the training curve and dev tables for the final report, from
+exact values (fractions) rounded once, half up.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import math
 import statistics
 import subprocess
 import sys
 from collections import Counter, defaultdict
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +59,13 @@ CURVE_ROWS = {
 }
 # The 176-200 format error rate is printed with two decimals (0.85%).
 CURVE_DECIMALS_OVERRIDE = {((176, 200), "format_error_rate_per_tool_call"): 2}
+# Audit revision 4-1: the two values that did not match, corrected in the erratum at the end of CHECKPOINT-3.
+ERRATA = {
+    "curve 76-100 format_error_rate_per_tool_call": 2.0,
+    "mixed-group fraction, mean of the 10 steps up to 195": 0.625,
+}
+ERRATUM_SOURCE = f"{CP3} 勘误（阶段 4 复核，2026-10-13）"
+CURVE_HEADER = ("步", "奖励", "有好有坏的组", "熵", "每次调用格式错误率", "logprob 差均值", "KL(k3)", "平均轮数", "步时 s")
 DEV_STEPS = (0, 25, 50, 75, 100, 125, 150, 175, 200)
 DEV_SOLVED = (451, 475, 501, 500, 516, 543, 551, 557, 551)
 DEV_STRICT_PCT = (56.4, 59.4, 62.6, 62.5, 64.5, 67.9, 68.9, 69.6, 68.9)
@@ -71,9 +84,46 @@ def on_tie(computed: float, reported: float, decimals: int) -> bool:
 
 def step_value(s: dict[str, Any], field: str) -> float:
     """A step's value; the reward is a count of 0/1 episodes logged as a 4-decimal mean, so restore it exactly."""
+    return float(exact_step_value(s, field))
+
+
+def exact_step_value(s: dict[str, Any], field: str) -> Fraction:
     if field == "reward_mean":
-        return round(s["reward_mean"] * s["episodes"]) / s["episodes"]
-    return s[field]
+        return Fraction(round(s["reward_mean"] * s["episodes"]), s["episodes"])
+    return Fraction(str(s[field]))
+
+
+def round_half_up(x: Fraction, decimals: int) -> str:
+    """``x`` rounded once, half away from zero for x >= 0, printed with ``decimals`` places."""
+    n = math.floor(x * 10 ** decimals + Fraction(1, 2))
+    if decimals == 0:
+        return str(n)
+    return f"{n // 10 ** decimals}.{n % 10 ** decimals:0{decimals}d}"
+
+
+def curve_table(steps: list[dict[str, Any]]) -> str:
+    """The 25-step training curve table, from exact segment means rounded once (audit revision 4-1 item 3)."""
+    lines = ["| " + " | ".join(CURVE_HEADER) + " |", "|" + "---|" * len(CURVE_HEADER)]
+    for lo, hi in CURVE_ROWS:
+        seg = [s for s in steps if lo <= s["step"] <= hi]
+        cells = [f"{lo}–{hi}"]
+        for field, dec, scale in CURVE_COLUMNS:
+            dec = CURVE_DECIMALS_OVERRIDE.get(((lo, hi), field), dec)
+            mean = sum(exact_step_value(s, field) for s in seg) / len(seg) * scale
+            cells.append(round_half_up(mean, dec) + ("%" if scale == 100 else ""))
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def dev_table(rows: list[dict[str, Any]]) -> str:
+    """The dev results per checkpoint, rounded once."""
+    head = ["步"] + [str(r["step"]) for r in rows]
+    solved = ["严格解出数"] + [str(r["solved"]) for r in rows]
+    strict = ["严格解出率"] + [round_half_up(Fraction(100 * r["solved"], r["episodes"]), 1) + "%" for r in rows]
+    tc = ["test+challenge"] + [round_half_up(Fraction(100 * r["tc_solved"], r["episodes"]), 1) + "%" for r in rows]
+    out = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+    out += ["| " + " | ".join(r) + " |" for r in (solved, strict, tc)]
+    return "\n".join(out) + "\n"
 
 
 def select_checkpoint(solved: dict[int, int], episodes: int) -> dict[str, Any]:
@@ -91,10 +141,18 @@ class Checks:
         self.items: list[dict[str, Any]] = []
 
     def add(self, item: str, computed: Any, reported: Any, source: str, decimals: int | None = None) -> None:
+        extra = {}
+        if item in ERRATA:
+            extra = {"reported_before_erratum": reported, "erratum": ERRATUM_SOURCE}
+            reported = ERRATA[item]
         ok = computed == reported if decimals is None else matches(computed, reported, decimals)
         tie = decimals is not None and on_tie(computed, reported, decimals)
         self.items.append({"item": item, "computed": computed, "reported": reported, "decimals": decimals,
-                           "source": source, "ok": ok, "half_unit_tie": tie})
+                           "source": source, "ok": ok, "half_unit_tie": tie, **extra})
+
+    @property
+    def corrected(self) -> list[dict[str, Any]]:
+        return [c for c in self.items if "erratum" in c]
 
     def add_extreme(self, item: str, steps: list[dict[str, Any]], field: str, pick: Any, reported_step: int,
                     reported: float, source: str, decimals: int, scale: float = 1) -> None:
@@ -214,7 +272,7 @@ def main(argv: list[str] | None = None) -> int:
         n = sum(r["reward"] for r in ev)
         tc = sum(int(bool(r["grade"].get("pass_non_generated"))) for r in ev)
         solved[step] = n
-        dev_rows.append({"step": step, "episodes": len(ev), "solved": n, "strict": n / len(ev),
+        dev_rows.append({"step": step, "episodes": len(ev), "solved": n, "tc_solved": tc, "strict": n / len(ev),
                          "test_challenge": tc / len(ev)})
         c.add(f"dev step {step} episodes / errors", [len(ev), sum(1 for r in ev if r.get("error"))], [800, 0], DEV)
         c.add(f"dev step {step} tasks are dev_ids, K=8 each",
@@ -236,7 +294,7 @@ def main(argv: list[str] | None = None) -> int:
     c.add("dev GRPO step 150 minus step 0 (points)", 100 * (solved[150] - solved[0]) / 800, 12.5,
           f"{CP3} 留出集三方对比 表下第 2 条", 1)
 
-    # Other readings of the two numbers that do not match, so the auditor can see which one the report used.
+    # Other readings of the two numbers corrected in the erratum, so the auditor can see which one the report used.
     def seg_steps(lo: int, hi: int) -> list[dict[str, Any]]:
         return [s for s in steps if lo <= s["step"] <= hi]
 
@@ -257,15 +315,24 @@ def main(argv: list[str] | None = None) -> int:
                                                                  for s in seg_steps(181, 190)),
         },
     }
+    tables = {"curve": curve_table(steps), "dev": dev_table(dev_rows)}
     result = {"checks": len(c.items), "failed": len(c.failed), "failures": c.failed,
+              "corrected_by_erratum": [{k: t[k] for k in ("item", "computed", "reported_before_erratum", "reported")}
+                                       for t in c.corrected],
               "half_unit_ties": [{k: t[k] for k in ("item", "computed", "reported")} for t in c.ties],
-              "diagnostics": diagnostics, "choice": choice, "dev": dev_rows, "curve": seg_means, "items": c.items}
+              "diagnostics": diagnostics, "choice": choice, "dev": dev_rows, "curve": seg_means,
+              "tables_markdown": tables, "items": c.items}
     a.out.parent.mkdir(parents=True, exist_ok=True)
     a.out.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    (a.out.parent / "training-tables.md").write_text(
+        "<!-- generated by scripts/closeout/verify_training.py: exact values rounded once -->\n\n"
+        + tables["curve"] + "\n" + tables["dev"], encoding="utf-8")
     for it in c.items:
         print(("ok   " if it["ok"] else "FAIL ") + f"{it['item']}: computed {it['computed']!r} reported {it['reported']!r}")
-    print(f"{len(c.items)} checks, {len(c.failed)} failed, {len(c.ties)} on a half-unit tie; "
-          f"chosen step {choice['chosen']} -> {a.out}")
+    print(tables["curve"])
+    print(tables["dev"])
+    print(f"{len(c.items)} checks, {len(c.failed)} failed, {len(c.corrected)} checked against the erratum, "
+          f"{len(c.ties)} on a half-unit tie; chosen step {choice['chosen']} -> {a.out}")
     return 1 if c.failed else 0
 
 
