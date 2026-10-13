@@ -1442,3 +1442,28 @@ dev 集 100 题，K=8，800 个 episode，运行时 LoRA：
   - 第 125 步和第 150 步正好差 1.0 个百分点（8 个 episode），不算“不到 1 个百分点”。而且比较的基准是最高值第 175 步，不是第 150 步，所以不会再往前链式比较。
   - 汇总记录里的严格解出率保留三位小数（例如 0.696），上表用逐条记录重新数了解出数。
 - 下一步：把第 150 步的适配器合并成 fp16（`runs/grpo-v1/merged-fp16-step-150`），然后进入第 5 步。
+
+## 阶段 3 · 第 5 步：留出集评测
+
+### GRPO 检查点合并
+
+- `python -m arl.sft.merge_fp16 --adapter runs/grpo-v1/adapters/step-150 --out runs/grpo-v1/merged-fp16-step-150`。基座快照 70d244cc 以 fp16 加载，用时 15 秒。`config.json` 和 `runs/sft-v1/merged-fp16` 的完全相同。
+- **合并核对**（`runs/phase3/merge-check/`）：在 3 段文本上比较合并模型和“fp16 基座 + step-150 适配器”的逐 token logprob。
+  - 平均差 0.0055，最大 0.055。
+  - 作为对比，适配器本身相对基座的平均差是 0.50。
+  - 合并后的差异只是 fp16 权重舍入，属于预注册已知局限里“运行时 LoRA 和合并权重之间的数值差别”。
+
+### 开始前逐条确认预注册（`HELDOUT-PREREG.zh-CN.md`，含修订 2C-3 和 3-1）
+
+1. **三个模型**，都用 token 客户端，环境 `phase1-env-v1`，fp16，vLLM `--dtype half`：
+   - 基座 `Qwen/Qwen3-1.7B` 快照 70d244cc，直接以 fp16 加载（`eval_heldout.sh` 对基座传 `--revision`）；
+   - SFT-v1：第 2 步 `merge_fp16.sh` 的结果 `runs/sft-v1/merged-fp16`，不用 `runs/sft-preview/merged`；
+   - GRPO：第 150 步的适配器合并成 fp16（`runs/grpo-v1/merged-fp16-step-150`），不用运行时 LoRA。确认。
+2. **检查点选法**：只看 dev 严格解出率（K=8，修订 3-1），取最高；相差不到 1 个百分点取更早的步，结果是第 150 步（见第 4 步）。dev 集和留出集不相交。确认。
+3. **留出集**：`data/tasks/heldout.jsonl` 的 sha256 实测 `d28e0709bb81af8196837efaec77ed3833d952ea25fcc1d457aa87f15d7cc3d4`，和预注册一致。1500 题，第 1–4 步没有读它做任何评测。确认。
+4. **每题 K=4，只跑一次**（修订 3-1 明确留出集不改为 K=8）。`eval_heldout.sh` 在 `runs/heldout/<name>.jsonl` 已存在时拒绝运行，只有中断后才用 `--resume` 续跑同一次运行，已完成的 episode 不会重采。确认。
+5. **采样**：temperature 0.8、top_p 1.0、top_k 20，配置里写明 `top_k: 20`。客户端是 `configs/sft/v1-eval.json` 换模型名，脚本里断言 (tokens, 0.8, 1.0, 20)。确认。
+6. **主指标**是严格解出率（隐藏用例全过）。次要指标：test+challenge 解出率；按 bug 类型和数据来源分开的严格解出率；每次工具调用的格式错误率（另报至少出错一次的 episode 比例，不作门槛）；平均轮数。由 `arl.rl.heldout` 输出。确认。
+7. **统计**：按 `bug_source` 来源函数做聚类 bootstrap，有放回重抽簇，10000 次，seed 0，簇内题全部带上。每题先算 K=4 的解出率，再在抽中的簇上取平均。报告 GRPO−SFT、SFT−基座两组同题配对差值和 95% 置信区间。确认。
+8. **已知局限**：会在 CHECKPOINT-3 逐条说明实际影响。确认。
+9. 运行方式：三个模型依次各跑一次（基座、SFT-v1、GRPO），GPU 一次只跑一个，vLLM `--gpu-memory-utilization 0.85`，并发 16。按第 2 步每小时约 5600 个 episode 估算，每个模型 6000 个 episode 约 1.1 小时，三个共约 3.5 小时。
