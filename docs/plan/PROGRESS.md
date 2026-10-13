@@ -1627,3 +1627,26 @@ dev 集 100 题，K=8，800 个 episode，运行时 LoRA：
 - `uv run pytest -q` → 296 passed，6 skipped（多出的 1 个是取整测试）；
 - `~/.venvs/vllm` 全量 → 310 passed，2 skipped；
 - `~/.venvs/train` 里跑 `tests/train tests/rl` → 50 passed，1 skipped。
+
+## 第 3 步：README 重写
+
+- 第一屏：
+  - 一句话说明项目；
+  - 留出集三个数字和两组配对区间，出处写到报告第 5.1 节和复核脚本；
+  - mermaid 流程图：题集 → 环境 → SFT → GRPO → 留出集评测；
+  - 报告链接，以及一句局限。
+- 删掉了"当前状态：阶段 1（环境与题集）进行中"和开头"单卡 4090、1.5B–3B"的旧描述。旧的"服务器（4090）"一节并入新的"服务器上怎么跑"。
+- 新增"项目历史"：阶段 1 到 4 的 tag（含提交号）、一句话结论、对应记录。`phase3-grpo-v1` 和 `final-v1` 在第 5 步打。
+- 新增"服务器上怎么跑"，按 PROGRESS 阶段 3 第 1–3 步和 CHECKPOINT-3"遇到的问题"整理：
+  - 驱动 580 以上；
+  - 非 root 用户；
+  - bwrap 的 AppArmor 规则，以及怎么验证；
+  - `python3.12-dev`；
+  - venv 的 bin 目录放进 PATH，否则 FlashInfer 找不到 ninja；
+  - hf-mirror 卡住时手动上传并核对 sha256，ModelScope 脚本作备选；
+  - colocate 的 `gpu_memory_utilization` 0.45 和 `cuda_memory_limit_gib` 16，换卡要重新探测；
+  - 没有 tmux 时用 `setsid nohup`。
+  - AppArmor 规则文件和 `setup.sh` 的检查在第 4 步加，这一步的 README 只写手动做法。
+- 原有的工具说明、生成题集、接入 policy、启动推理服务、付费 API 几节保留，放在后面。接入 policy 一节补了一句 token 级客户端。
+
+测试结果：uv 296 passed、6 skipped；vLLM 环境 310 passed、2 skipped；train 环境 `tests/train tests/rl` 50 passed、1 skipped。
