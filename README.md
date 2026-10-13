@@ -44,6 +44,8 @@ flowchart LR
 阶段 3 在一台 A800-SXM4-40GB 上跑（Ubuntu 24.04，驱动 595.84）。下面是那次踩过的坑，下次租机照着做。来源是 `docs/plan/PROGRESS.md`"阶段 3 · 第 1 步"到"第 3 步"，以及 `docs/plan/CHECKPOINT-3.md`"遇到的问题"。
 
 1. **驱动**：选驱动 580 以上的镜像（`nvidia-smi` 里 CUDA Version 至少 13.0）。torch 2.13.0 和 vLLM 0.31.0 没有能在 CUDA 12.x 上用的官方组合，`setup.sh` 遇到更低的驱动会停下（`scripts/server/sync.md`）。
+`scripts/server/setup.sh` 在装任何东西之前会先检查第 2–4 条，不满足就停下并打印修法。脚本本身不改系统配置，要 root 的修法由你手动执行。这三项检查只在本地测过（`tests/test_server_scripts.py`），还没在服务器上跑过。
+
 2. **用非 root 用户**：沙箱用 `RLIMIT_NPROC` 挡 fork 炸弹，root 不受这个限制，防 fork 炸弹的 2 项测试会失败。先用 root 建一个普通用户，之后所有命令都以这个用户执行。root 只用来装系统包：
 
    ```bash
@@ -52,7 +54,7 @@ flowchart LR
    ```
 
 3. **bwrap 的 AppArmor 规则**：Ubuntu 24.04 默认不让非特权进程创建 user namespace，bwrap 起不来，沙箱测试会被跳过。
-   - 用 root 给 `/usr/bin/bwrap` 加一条允许 `userns` 的 AppArmor 配置，然后 `apparmor_parser -r` 加载它。
+   - 规则在 `scripts/server/bwrap-userns.apparmor`。用 root 安装：`install -m 644 scripts/server/bwrap-userns.apparmor /etc/apparmor.d/bwrap-userns && apparmor_parser -r /etc/apparmor.d/bwrap-userns`。
    - 验证：以普通用户跑 `uv run pytest -q tests/test_sandbox.py`，要求 25 passed、0 skipped（13 项 bwrap 检查一项都不能跳过）。
 4. **`python3.12-dev`**：venv 用的是系统的 `/usr/bin/python3.12`。triton 运行时要编译 `cuda_utils.c`，没有 `Python.h` 时 GradScaler 那条路径的 GPU 测试会失败。用 root 装：`apt-get install -y python3.12-dev`。
 5. **venv 的 bin 目录放进 PATH**：vLLM 预热时 FlashInfer 要 JIT 编译采样 kernel，会调用 `ninja`。`ninja` 装在 `~/.venvs/vllm/bin`，不在 PATH 里就会报 `FileNotFoundError: 'ninja'`。
