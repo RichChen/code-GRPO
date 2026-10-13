@@ -1679,3 +1679,19 @@ dev 集 100 题，K=8，800 个 episode，运行时 LoRA：
 - **这些改动没有在服务器上验证**，只在本地做了 `bash -n` 和单元测试。
 
 测试结果：uv 310 passed、6 skipped（新增 14 项）；vLLM 环境 324 passed、2 skipped；train 环境 `tests/train tests/rl` 50 passed、1 skipped。
+
+## 第 5 步：tag 和 CHECKPOINT-4
+
+- README"服务器上怎么跑"补上第 4 步的内容：`setup.sh` 会先检查非 root、`Python.h`、bwrap 三项，并写明还没在服务器上跑过。bwrap 一条改成用 `scripts/server/bwrap-userns.apparmor` 安装。
+- 三套全量测试（依次跑）：uv 310 passed、6 skipped；vLLM 环境 324 passed、2 skipped；train 环境 `tests/train tests/rl` 50 passed、1 skipped。
+- tag：
+  - `phase3-grpo-v1` → `cf3ebc5`（CHECKPOINT-3 的提交），附注 tag；
+  - `final-v1` → 本步的提交。
+- 写了 `docs/plan/CHECKPOINT-4.md`，内容包括：
+  - 第 1–4 步的结论；
+  - 复核结果，含两处勘误和 14 处恰好差半个单位的逐项表；
+  - 新写和修改的文件、测试、两个 tag；
+  - 留给后续的事项：A6-R 在 coding-harness 和 coding-agent 里做，A6-M 等 A6-R 之后再考虑，需要重新租 GPU，约 20 小时；
+  - push 前的检查项：密钥扫描、`.gitignore`、仓库大小、tag 要一起推。
+- CHECKPOINT-4 的提交（`efe8590`）漏带了 PROGRESS 的这一节：编辑刚写完就执行 `git add`，WSL 里文件还没落盘。补了一个提交，并把还没推送过的本地 tag `final-v1` 改为指向补交的提交，这样它仍然是本阶段的最后一个提交。
+- 到此停下。没有 `git push`。
