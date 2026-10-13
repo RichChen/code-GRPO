@@ -10,7 +10,7 @@
   - `configs/grpo/v1.json` 的 sha256 等于冻结值。
 - **新文档**：`docs/FINAL-REPORT.zh-CN.md`（最终报告），重写的 `README.md`。表格由复核脚本从精确值只取整一次生成。
 - **服务器脚本**：`setup.sh` 加了三项前置检查，新增 AppArmor 规则文件，`sync.md` 改成 git bundle 加 tar 和 sha256。没有在服务器上验证。
-- **tag**：`phase3-grpo-v1` 指向 `cf3ebc5`；`final-v1` 指向提交本文件的那个提交。
+- **tag**：`phase3-grpo-v1` 指向 `cf3ebc5`；`final-v1` 指向本阶段的最后一个提交（`git rev-list -n1 final-v1` 可查）。
 
 ## 第 1–4 步的结论
 
@@ -109,7 +109,7 @@
 | tag | 指向 | 说明 |
 |---|---|---|
 | `phase3-grpo-v1` | `cf3ebc5` | CHECKPOINT-3：GRPO 第 150 步，留出集结果 |
-| `final-v1` | 提交本文件的那个提交 | 阶段 4 收尾 |
+| `final-v1` | 本阶段的最后一个提交 | 阶段 4 收尾。CHECKPOINT-4 第一次提交（`efe8590`）漏带了 PROGRESS，补交后 tag 移到最后一个提交，见 PROGRESS 第 5 步 |
 
 之前的 tag 没有动：`phase1-tasks-v1`（`436d8db`）、`phase1-env-v1`（`14c155e`）、`phase2-grader-v1`（`a73e4e0`）、`sft-v1`（`576d202`）、`grpo-tasks-v1`（`2f847cb`）。
 
