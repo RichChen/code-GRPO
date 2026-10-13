@@ -1,0 +1,17 @@
+# AppArmor profile that lets bubblewrap create unprivileged user namespaces (Ubuntu 23.10 and later).
+# The sandbox (src/arl/env/sandbox.py) runs every test inside bwrap with --unshare-user; without this rule
+# bwrap fails and tests/test_sandbox.py skips its 13 bwrap checks.
+#
+# Install by hand as root (scripts/server/setup.sh only prints these lines, it never runs them):
+#   install -m 644 scripts/server/bwrap-userns.apparmor /etc/apparmor.d/bwrap-userns
+#   apparmor_parser -r /etc/apparmor.d/bwrap-userns
+# Check as the ordinary user: uv run pytest -q tests/test_sandbox.py  ->  25 passed, 0 skipped.
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+
+  include if exists <local/bwrap>
+}

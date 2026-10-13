@@ -1650,3 +1650,32 @@ dev 集 100 题，K=8，800 个 episode，运行时 LoRA：
 - 原有的工具说明、生成题集、接入 policy、启动推理服务、付费 API 几节保留，放在后面。接入 policy 一节补了一句 token 级客户端。
 
 测试结果：uv 296 passed、6 skipped；vLLM 环境 310 passed、2 skipped；train 环境 `tests/train tests/rl` 50 passed、1 skipped。
+
+## 第 4 步：服务器脚本补全（没有在服务器上验证）
+
+- `scripts/server/setup.sh` 开头加了三项检查，都在装任何东西之前。不通过就停下，并打印修法。脚本本身不改系统配置。
+  1. 当前用户是 root 就停下：说明 root 不受 `RLIMIT_NPROC` 限制，提示 `adduser --disabled-password --gecos "" arl && su - arl`。
+  2. PATH 里有 `python3.12` 时，看 `sysconfig` 的 `INCLUDEPY` 下有没有 `Python.h`。没有就停下，提示 `apt-get install -y python3.12-dev`。
+     - 阶段 3 服务器上这就是 `uv venv --python 3.12` 用的 `/usr/bin/python3.12`。
+     - 没有系统 python3.12 时，uv 会用自己的构建，它自带头文件，所以只打印一行说明，不停下。
+  3. bwrap 不存在时提示装 `bubblewrap`。以当前用户跑 `bwrap --unshare-user --unshare-pid --unshare-net --ro-bind / / true`，失败就停下，打印安装 AppArmor 规则的两条 root 命令。
+- 新文件 `scripts/server/bwrap-userns.apparmor`：给 `/usr/bin/bwrap` 一个允许 `userns` 的 unconfined profile。
+  - 这是 Ubuntu 23.10 以后给单个程序放开非特权 user namespace 的标准写法。
+  - 阶段 3 审计方在服务器上装的 `/etc/apparmor.d/bwrap-userns` 原文我没有看到，所以这份不一定和它逐字相同，需要审计方核对。
+  - 文件里写了安装和验证的命令，由用户用 root 手动安装。
+- `scripts/server/sync.md` 改写：
+  - 代码用 git bundle 双向同步，包括首次 clone、增量 bundle、`git bundle verify`、只用 `--ff-only` 合并；
+  - 上传数据前后用 sha256 清单核对；
+  - 拉回数据时在服务器上先生成逐文件 sha256 清单，再按清单打 tar；本地解包后 `sha256sum -c`；两个 fp16 合并模型不拉回。
+  - 原来"传什么、不传什么"的清单保留。
+- 顺带把 `setup.sh` 第一行注释里的"单卡 4090"改成"单卡 GPU 服务器（阶段 3 用的 A800 40GB）"。
+- 新测试 `tests/test_server_scripts.py`，14 项：
+  - `scripts/` 下全部 `.sh` 都过 `bash -n`；
+  - 用假的 `id`、`python3.12`、`bwrap` 分别触发三项检查的失败分支，确认退出码不为 0、提示文字正确；
+  - 确认停下时没有走到后面的命令（假的 `nvidia-smi`、`uv`、`curl` 等一旦被调用就会留下标记文件）；
+  - AppArmor 文件只有一个 profile，并且含 `userns,`。
+  - 只测了失败分支，检查全部通过的那条路径会真的去装环境，没有在测试里跑。
+- 本机上手动确认过这两项在正常环境下能通过，不会误报：uv 的 python3.12 带 `Python.h`；`bwrap --unshare-user … true` 成功。
+- **这些改动没有在服务器上验证**，只在本地做了 `bash -n` 和单元测试。
+
+测试结果：uv 310 passed、6 skipped（新增 14 项）；vLLM 环境 324 passed、2 skipped；train 环境 `tests/train tests/rl` 50 passed、1 skipped。
