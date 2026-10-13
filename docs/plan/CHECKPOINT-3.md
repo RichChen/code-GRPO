@@ -169,3 +169,21 @@ dev 集 100 题，K=8，800 个 episode，T=0.8，top_k 20，运行时 LoRA：
 - 测速和探测：`runs/server-bench/`，包括 `colocate-probe-nogc/`。
 - 留出集：`runs/heldout/`。
 - 阶段 3 的时间和日志：`runs/phase3/`。
+
+## 勘误（阶段 4 复核，2026-10-13）
+
+阶段 4 第 1 步用 `scripts/closeout/verify_training.py` 从 `runs/grpo-v1/log.jsonl` 重新计算，发现下面两处和原始日志对不上。按审计修订 4-1，正文不改，只在这里追加。两处都只是监控指标的文字描述，不影响留出集的数字、检查点的选择和任何停止判断。
+
+1. **"GRPO 训练曲线"表，76–100 行的"每次调用格式错误率"。**
+   - 原文：2.1%。
+   - 正确值：**2.0%**（这 25 步逐步比率的平均是 2.049%）。
+   - 原因：先把平均值取成 4 位小数（0.0205），再换算成百分比（2.05%）印成 2.1%，取整了两次。从精确值直接四舍五入是 2.0%。其他 7 行用两种做法结果相同。
+   - 出处：`runs/closeout/verify-training.json` 里 `items` 中 `"item": "curve 76-100 format_error_rate_per_tool_call"` 的 `computed`（2.0492）；`diagnostics.format_error_rate_per_call_by_segment["76-100"]` 列出了三种算法的结果（逐步平均 2.0492、取 4 位小数后 2.05、总错误数除以总调用数 2.0545）。
+2. **"审计修订 3-1 的执行情况 / 第 3 条"："当时最近 10 步有好有坏的组的比例约 0.66"。**
+   - 原文：约 0.66。
+   - 正确值：**0.625**（第 186–195 步的均值）。
+   - 原因：0.66 是 176–200 这一段的均值（0.6575），被当成了第 195 步的 10 步窗口的值。
+   - 出处：`runs/closeout/verify-training.json` 里 `items` 中 `"item": "mixed-group fraction, mean of the 10 steps up to 195"` 的 `computed`（0.625）；`diagnostics.mixed_group_fraction` 的 `steps_186_195_window_of_step_195`（0.625）和 `segment_176_200_mean`（0.6575）。
+   - 结论不变：0.625 仍远高于门槛 0.25，第 195 步按修订 3-1 的规则不停止，代码也没有停。
+
+PROGRESS"正式训练结束"一节有同样的表格和"均值约 0.66"一句，原文也不改，那一节末尾加了一行指向这里。
