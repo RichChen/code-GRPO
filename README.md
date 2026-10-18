@@ -1,4 +1,6 @@
-# agentic-rl
+# code-GRPO（agentic-rl）
+
+仓库名是 `code-GRPO`，Python 包名是 `arl`；早先的计划文档里把这个项目叫 agentic-rl。
 
 用 SFT 和自己实现的多轮 GRPO，训练 Qwen3-1.7B 在沙箱里用五个工具修复 Python 代码里的单个 bug，并在预注册的留出集上评测。
 
@@ -23,6 +25,17 @@ flowchart LR
 
 完整报告：[docs/FINAL-REPORT.zh-CN.md](docs/FINAL-REPORT.zh-CN.md)。报告里写了背景（前置项目 A5 的零结果）、做法、过程中修好的问题、局限和花费。
 
+## 几个关键决定
+
+训练跑通不难，难的是让训练和推理看到同一条序列。下面几条是这次真正花时间的地方，报告里有完整推导：
+
+- **按轮切 SFT 样本。** Qwen3 的聊天模板渲染历史 assistant 轮时会去掉 think 块，整段训练和推理的 token 就不一致。改成"前 t−1 轮 mask 掉、只对第 t 轮算 loss"，并用 vLLM `/tokenize` 对 4410 个前缀逐 token 比对，0 处不一致（报告 6.3、[CHECKPOINT-2A](docs/plan/CHECKPOINT-2A.md)）。
+- **token 级客户端。** rollout 直接记录每轮的 token id 和采样时的 logprob，训练用这些 id，不重新渲染 prompt，省掉一次模板渲染带来的偏差（报告 4.4）。
+- **TIS 与 logprob 监控。** 训练端和推理端的 logprob 有差异，用截断重要性采样修正，并把 `max_logprob_diff_mean` 设成停止条件之一；实测逐步均值差 0.0015，TIS 截断比例 0（报告 4.4）。
+- **全程 fp16，学习率按 LoRA 调。** LoRA 的合适学习率约是全参数的 10 倍，正式配置用 1e-5、过拟合测试用 5e-5；训练、采样、评测统一 fp16，避免校准起点和训练起点不是同一个模型（[PHASE-2C-LOCAL-PREP](docs/plan/PHASE-2C-LOCAL-PREP.zh-CN.md) 审计修订 2C-3）。
+- **显存按数值等价的办法降。** 本地过拟合测试 OOM 后，先把 logits、熵、cross entropy 的峰值分段测出来，再分块计算、把熵移到 `backward()` 之后，并在 CPU 上用 1e-5 的误差验证 loss 和梯度等价（同上，审计修订 2C-3 第 4 条）。
+- **判分只在宿主机。** 隐藏用例是 `call`/`check` 对：`call` 在沙箱里求值，`check` 在宿主机上对解码后的值求值。工具只有五个，没有 `write_file` 和任意 shell（报告 3.1、3.2）。
+
 局限：只测了一个模型规模和合成的单 bug 题，没有在 SWE-bench 这类真实仓库任务上验证；GRPO 只跑了一组超参数。详见报告第 7 节。
 
 环境：WSL / Linux，Python 3.12。`uv sync` 安装依赖，`uv run pytest -q` 跑测试。训练和推理用另外两个 venv（`~/.venvs/train`、`~/.venvs/vllm`），见下面"服务器上怎么跑"。
@@ -37,7 +50,7 @@ flowchart LR
 | 3 A800 上的 GRPO | `phase3-grpo-v1`（`cf3ebc5`） | 200 步，20 小时 57 分，没有触发停止条件；按预注册规则选第 150 步；留出集上比 SFT 高 13.2 个百分点 | `docs/plan/CHECKPOINT-3.md` |
 | 4 收尾 | `final-v1` | 本地复算全部报告数字，CHECKPOINT-3 有两处监控指标的文字描述不对，已加勘误；写最终报告、README 和服务器脚本 | `docs/plan/CHECKPOINT-4.md` |
 
-各阶段的计划和每一步的记录在 `docs/plan/`，进度流水在 `docs/plan/PROGRESS.md`。
+各阶段的计划和每一步的记录在 [`docs/plan/`](docs/plan/INDEX.md)，进度流水在 `docs/plan/PROGRESS.md`（按时间追加，不是入口文档）。
 
 ## 服务器上怎么跑
 

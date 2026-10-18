@@ -15,3 +15,6 @@ data/tasks/*.jsonl
 data/sft/**
 !data/sft/**/
 !data/sft/**/stats.json
+
+# 逐轮派工提示词只保留在 git 历史里，见 docs/plan/INDEX.md
+/docs/plan/*PROMPT*.md

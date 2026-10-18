@@ -477,7 +477,7 @@ uv run python scripts/closeout/verify_training.py    # runs/closeout/verify-trai
 
 | 内容 | 位置 |
 |---|---|
-| 阶段 1 计划（环境和题集） | `docs/plan/PHASE-1-ENV-AND-TASKS.zh-CN.md`，各轮 prompt 在 `docs/plan/PHASE-1*-PROMPT.zh-CN.md` |
+| 阶段 1 计划（环境和题集） | `docs/plan/PHASE-1-ENV-AND-TASKS.zh-CN.md`，含审计修订 1–4 |
 | 阶段 1 检查点 | `docs/plan/CHECKPOINT-1A.md`（工具、沙箱、判分），`1B`（造题），`1C`（簇划分、试点），`1D`（冻结、诊断扫描、DeepSeek 上限、假阴性） |
 | 阶段 2 计划和检查点（SFT） | `docs/plan/PHASE-2-SFT.zh-CN.md`，`docs/plan/CHECKPOINT-2A.md` |
 | 阶段 2C（租卡前的本地准备） | `docs/plan/PHASE-2C-LOCAL-PREP.zh-CN.md`；结果记在 PROGRESS"Phase 2C"一节，没有单独的 CHECKPOINT 文件 |
