@@ -27,12 +27,12 @@ flowchart LR
 
 ## 几个关键决定
 
-训练跑通不难，难的是让训练和推理看到同一条序列。下面几条是这次真正花时间的地方，报告里有完整推导：
+真正花时间的是让训练和推理看到同一条序列。下面几条是具体问题和解法，报告里有完整推导：
 
 - **按轮切 SFT 样本。** Qwen3 的聊天模板渲染历史 assistant 轮时会去掉 think 块，整段训练和推理的 token 就不一致。改成"前 t−1 轮 mask 掉、只对第 t 轮算 loss"，并用 vLLM `/tokenize` 对 4410 个前缀逐 token 比对，0 处不一致（报告 6.3、[CHECKPOINT-2A](docs/plan/CHECKPOINT-2A.md)）。
 - **token 级客户端。** rollout 直接记录每轮的 token id 和采样时的 logprob，训练用这些 id，不重新渲染 prompt，省掉一次模板渲染带来的偏差（报告 4.4）。
 - **TIS 与 logprob 监控。** 训练端和推理端的 logprob 有差异，用截断重要性采样修正，并把 `max_logprob_diff_mean` 设成停止条件之一；实测逐步均值差 0.0015，TIS 截断比例 0（报告 4.4）。
-- **全程 fp16，学习率按 LoRA 调。** LoRA 的合适学习率约是全参数的 10 倍，正式配置用 1e-5、过拟合测试用 5e-5；训练、采样、评测统一 fp16，避免校准起点和训练起点不是同一个模型（[PHASE-2C-LOCAL-PREP](docs/plan/PHASE-2C-LOCAL-PREP.zh-CN.md) 审计修订 2C-3）。
+- **全程 fp16。** 正式训练采用学习率 1e-5，短程过拟合检查采用 5e-5；两者分别用于正式训练和验证训练链路。训练、采样、评测统一 fp16，避免校准起点和训练起点不是同一个模型（[PHASE-2C-LOCAL-PREP](docs/plan/PHASE-2C-LOCAL-PREP.zh-CN.md) 审计修订 2C-3）。
 - **显存按数值等价的办法降。** 本地过拟合测试 OOM 后，先把 logits、熵、cross entropy 的峰值分段测出来，再分块计算、把熵移到 `backward()` 之后，并在 CPU 上用 1e-5 的误差验证 loss 和梯度等价（同上，审计修订 2C-3 第 4 条）。
 - **判分只在宿主机。** 隐藏用例是 `call`/`check` 对：`call` 在沙箱里求值，`check` 在宿主机上对解码后的值求值。工具只有五个，没有 `write_file` 和任意 shell（报告 3.1、3.2）。
 
